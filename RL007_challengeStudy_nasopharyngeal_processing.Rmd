@@ -1,0 +1,574 @@
+---
+title: "RL007_challengeStudy_nasopharyngeal_processing"
+author: "Rik G.H. Lindeboom"
+date: "29/03/2023"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.height = 7, fig.width = 7)
+```
+
+```{r load required packages, echo=FALSE}
+set.seed(1)
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(harmony))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(sceasy))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(SoupX))
+suppressPackageStartupMessages(library(rvcheck))
+suppressPackageStartupMessages(library(cardelino))
+loompy <- reticulate::import('loompy')
+suppressPackageStartupMessages(library(randomcoloR))
+suppressPackageStartupMessages(library(circlize))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(numDeriv))
+suppressPackageStartupMessages(library(Rsamtools))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(glmmSeq))
+suppressPackageStartupMessages(library(future))
+source("/mnt/scripts/function_collection_rik.R")
+source("/mnt/scripts/glmm_functions_Rik.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Forest.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/getCondVal.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/col.rb.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/drawDendrogram.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Dotplot.R")
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(leiden))
+suppressPackageStartupMessages(library(ggseqlogo))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ggh4x))
+```
+
+```{r label="load final nasopharyngeal object to run without remaking object"}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.fil4.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+df_nasal@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_nasal@meta.data),] 
+rm(dfMeta)
+```
+
+```{r label="download GEX data for nasal swabs", eval=FALSE}
+firstManis <- read.csv("/mnt/projects/RL007_challengeStudy/data/samplesReady_nasalSwabsGex_49_031121.txt",stringsAsFactors = F,header = F)
+secondManis <- read.csv("/mnt/projects/RL007_challengeStudy/data/sampleIds_allNasalGexQ6.txt",stringsAsFactors = F,header = F)
+manis <- rbind(firstManis,secondManis)
+colnames(manis) <- "gexId"
+outDir <- "/mnt/projects/RL007_challengeStudy/data"
+
+manis$bamReady <- F
+for (i in 1:nrow(manis)) {
+  foo <- tryCatch(system(paste0("ils /archive/HCA/10X/",manis$gexId[i],"/starsolo/Aligned.sortedByCoord.out.bam")))
+  if (foo==0) { manis$bamReady[i] <- T } else { manis$bamReady[i] <- F }
+}
+
+for (i in 1:nrow(manis)) {
+  if (manis$bamReady[i]) {
+    cat(manis$gexId[i])
+    if (!dir.exists(paste0("/mnt/projects/RL007_challengeStudy/data/gex/",manis$gexId[i]))) { dir.create(paste0("/mnt/projects/RL007_challengeStudy/data/gex/",manis$gexId[i])) }
+    try(system(paste0("iget -r /archive/HCA/10X/",manis$gexId[i],"/starsolo/counts/Gene /mnt/projects/RL007_challengeStudy/data/gex/",manis$gexId[i])))
+    cat("\n\n")
+  }
+}
+
+```
+
+```{r label="import soupx corrected GEX data and merge samples", eval=FALSE}
+for (mySample in manis$gexId) {
+  if (!file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/Gene/cr3/soupx/"))) { print(paste0(mySample,": data not found")) } else { 
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/Gene/cr3/soupx/"))
+    filSample <- CreateSeuratObject(counts = filData,min.cells = 0, min.features = 200,project = mySample,assay = "RNA")
+    gc()
+    filSample <- RenameCells(filSample,add.cell.id = mySample)
+    if (!exists("fil")) {
+      fil <- filSample
+    } else {
+      if (sum(rownames(fil@meta.data) %in% rownames(filSample@meta.data))>0) { halt }
+      fil <- merge(fil, y = filSample, project = "COVID-19 Challenge Project - Nasal Swabs")
+    }
+    cat(paste0(mySample,"\n"))
+  }
+}
+
+write_rds(fil,file="/mnt/projects/RL007_challengeStudy/data/df_nasal.rds",compress = "gz")
+rm(filSample)
+gc()
+
+# Also create an anndata object for sharing and for celltypist
+sceasy::convertFormat(fil, from="seurat", to="anndata", outFile="/mnt/projects/RL007_challengeStudy/data/df_nasal.h5ad", transfer_layers = 'counts', drop_single_values = FALSE)
+df <- fil
+rm(fil)
+gc()
+```
+
+```{r label="make raw GEX object for sharing (no SoupX correction)", eval=FALSE}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.fil4.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+df_nasal@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_nasal@meta.data),] 
+rm(dfMeta)
+
+rm(fil)
+for (mySample in unique(df_nasal$orig.ident)) {
+  try(system(paste0("iget -r /archive/HCA/10X/",mySample,"/starsolo/counts/Gene /mnt/projects/RL007_challengeStudy/data/gex/",mySample)))
+  if (!file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/cr3/"))) { print(paste0(mySample,": data not found")) } else { 
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/cr3/"))
+    filSample <- CreateSeuratObject(counts = filData,min.cells = 0, min.features = 1,project = mySample,assay = "RNA")
+    gc()
+    filSample <- RenameCells(filSample,add.cell.id = mySample)
+    filSample <- subset(filSample,cells=colnames(filSample)[colnames(filSample)%in%rownames(df_nasal@meta.data)])
+    if (!exists("fil")) {
+      fil <- filSample
+    } else {
+      if (sum(rownames(fil@meta.data) %in% rownames(filSample@meta.data))>0) { halt }
+      fil <- merge(fil, y = filSample, project = "COVID-19 Challenge Project - raw data - Nasal Swabs")
+    }
+    try(system(paste0("rm -r /mnt/projects/RL007_challengeStudy/data/gex/",mySample))) 
+    cat(paste0(mySample,"\n"))
+  }
+}
+
+fil@meta.data[,colnames(df_nasal@meta.data)] <- df_nasal@meta.data[rownames(fil@meta.data),] 
+write_rds(fil,"/mnt/projects/RL007_challengeStudy/data/df_nasal_rawGex.fil5.rds",compress = "gz")
+fil <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal_rawGex.fil5.rds")
+
+sceasy::convertFormat(fil, from="seurat", to="anndata", outFile="/mnt/projects/RL007_challengeStudy/data/df_nasal_rawGex.fil4.h5ad", transfer_layers = 'counts', drop_single_values = FALSE)
+```
+
+```{r label="normalise GEX data and run an initial dim reduction", eval=FALSE}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.rds")
+df_nasal <- NormalizeData(df_nasal, assay = "RNA")
+df_nasal <- FindVariableFeatures(df_nasal)
+df_nasal <- ScaleData(df_nasal)
+df_nasal <- RunPCA(df_nasal,reduction.name = "pca_RNA")
+df_nasal <- RunUMAP(df_nasal,reduction = "pca_RNA", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapBeforeHarmony_RNA_')
+DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="orig.ident",shuffle = T,cols=randomColor(length(unique(df_nasal$orig.ident))),pt.size = .001,raster = F) + theme(aspect.ratio = 1) + NoLegend()
+```
+
+
+``` {r label="add predicted cell type labels from Yoshida et al 2022 Nature", eval=FALSE}
+for (i in c("yoshida_level2","yoshida_level3")) {
+  labels <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,".allNasal.predicted_labels.csv"),header = T,stringsAsFactors = F)
+  probs <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,".allNasal.probability_matrix.csv"),header = T,stringsAsFactors = F)
+  probs$max <- apply(probs[,2:ncol(probs)],1,max)
+  labels <- labels[labels$X%in%rownames(df_nasal@meta.data),]
+  probs <- probs[probs$X%in%rownames(df_nasal@meta.data),]
+  df_nasal@meta.data[labels$X,paste0(i,"_predLabel")] <- labels$predicted_labels
+  df_nasal@meta.data[probs$X,paste0(i,"_maxPredProb")] <- probs$max
+}
+
+DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="yoshida_level2_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level2_predLabel))),pt.size = .001,raster = F,label=T,repel = T) + theme(aspect.ratio = 1) + NoLegend()
+DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + theme(aspect.ratio = 1) + NoLegend()
+table(df_nasal@meta.data$yoshida_level2_predLabel)
+table(df_nasal@meta.data$yoshida_level3_predLabel)
+df_nasal
+```
+
+``` {r label="plot quick QCs",fig.width=10,fig.height=15}
+df_nasal[["percentMito"]] <- PercentageFeatureSet(df_nasal, pattern = "^MT-")
+df_nasal$nCount_RNA_log10 <- log10(df_nasal$nCount_RNA)
+df_nasal$nFeature_RNA_log10 <- log10(df_nasal$nFeature_RNA)
+
+(VlnPlot(df_nasal,c("nCount_RNA_log10"),group.by = "orig.ident") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + scale_fill_discrete(guide=FALSE)) +
+  (VlnPlot(df_nasal,c("nFeature_RNA_log10"),group.by = "orig.ident") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + scale_fill_discrete(guide=FALSE)) +
+  (VlnPlot(df_nasal,c("percentMito"),group.by = "orig.ident") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + scale_fill_discrete(guide=FALSE)) + patchwork::plot_layout(nrow=1,ncol=3,guides = "collect")
+
+(VlnPlot(df_nasal,c("nCount_RNA_log10"),group.by = "yoshida_level3_predLabel") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + NoLegend()) +
+  (VlnPlot(df_nasal,c("nFeature_RNA_log10"),group.by = "yoshida_level3_predLabel") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + NoLegend()) +
+  (VlnPlot(df_nasal,c("percentMito"),group.by = "yoshida_level3_predLabel") + theme(axis.text.y=element_text(size=5), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip() + NoLegend()) + patchwork::plot_layout(nrow=1,ncol=3)
+
+VlnPlot(df_nasal,c("nCount_RNA","nFeature_RNA","percentMito"),group.by = "yoshida_level3_predLabel")
+(FeaturePlot(df_nasal,features = "nCount_RNA_log10",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (FeaturePlot(df_nasal,features = "nFeature_RNA_log10",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (FeaturePlot(df_nasal,features = "percentMito",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (DimPlot(df_nasal,group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + theme(aspect.ratio = 1) + NoLegend()) + patchwork::plot_layout(ncol=2)
+
+df_nasal$nCount_RNA_woMT_log10 <- log10(Matrix::colSums(df_nasal[["RNA"]]@counts[!grepl("MT-",rownames(df_nasal[["RNA"]]@counts)),]))
+
+(FeaturePlot(df_nasal,features = "nCount_RNA_log10",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (FeaturePlot(df_nasal,features = "nCount_RNA_woMT_log10",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (FeaturePlot(df_nasal,features = "percentMito",max.cutoff = "q99") + theme(aspect.ratio = 1)) +
+  (DimPlot(df_nasal,group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + theme(aspect.ratio = 1) + NoLegend()) + patchwork::plot_layout(ncol=2)
+
+```
+
+``` {r label="annotate metadata", eval=FALSE}
+linkTable1 <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/Cov_Chall_Req_01_6666stdy_manifest_18018_251021.txt",sep = "\t",header = T,stringsAsFactors = F)
+linkTable2 <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/GEX_nasal_6666stdy_manifest_18425_060122.csv",sep = ",",header = T,stringsAsFactors = F)
+linkTable <- rbind(linkTable1[,colnames(linkTable1)],linkTable2[,colnames(linkTable1)])
+infectedTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/metadata_infected_hlaCompatible_byKayleeMail.txt",sep = "\t",header = T,stringsAsFactors = F)
+rownames(infectedTable) <- infectedTable$Sample.ID
+metaTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/Human_challenge_samples_processed_4th.xlsx_-_Nasal.tsv",sep = "\t",header = T,stringsAsFactors = F)
+metaTable <- metaTable[metaTable$Sample.ID!="",]
+metaTable$sangerId[metaTable$Sample.ID%in%linkTable$SUPPLIER.SAMPLE.NAME] <- unlist(sapply(metaTable$Sample.ID[metaTable$Sample.ID%in%linkTable$SUPPLIER.SAMPLE.NAME], function(x) linkTable$SANGER.SAMPLE.ID[linkTable$SUPPLIER.SAMPLE.NAME==x]))
+metaTable <- metaTable[!is.na(metaTable$sangerId),]
+rownames(metaTable) <- metaTable$sangerId
+df_nasal@meta.data[,c("sample_id","patient_id","time_point","cohort","viability","dateOfProcessing")] <- metaTable[df_nasal$orig.ident,c("Sample.ID","Hvivo.patient.ID","Time.point","Cohort","Vibaility","Date.of.processing")]
+df_nasal@meta.data[,c("covid_status","age","sex","hlaCompatibleWDextramers")] <- infectedTable[as.character(df_nasal$patient_id),c("Disease.status","Age","Sex","Compatible.HLA")]
+
+```
+
+``` {r label="annotate viral reads",fig.width=5,fig.height=5, eval=FALSE}
+df_nasal$viral_abundance_soupx <- FetchData(df_nasal,"VIRAL-SARS-CoV2")
+FeaturePlot(df_nasal,features = c("viral_abundance_soupx","viral_abundance_raw"),order = T,max.cutoff = "q99") +
+  (DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + NoLegend())
+
+df_nasal$viral_abundance_raw <- 0
+for (mySample in unique(df_nasal$orig.ident)) {
+  if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/Gene/cr3/soupx/"))) { 
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/gex/",mySample,"/Gene/cr3/"))
+    filData <- filData[,paste0(mySample,"_",colnames(filData))%in%rownames(df_nasal@meta.data)]
+    df_nasal@meta.data[paste0(mySample,"_",colnames(filData)),"viral_abundance_raw"] <- as.numeric(filData["VIRAL_SARS-CoV2",])
+  } else if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))) {
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))
+    filData <- filData[["Gene Expression"]][,paste0(mySample,"_",colnames(filData[["Gene Expression"]]))%in%rownames(df_nasal@meta.data)]
+    df_nasal@meta.data[paste0(mySample,"_",colnames(filData)),"viral_abundance_raw"] <- as.numeric(filData["VIRAL_SARS-CoV2",])
+  } else { print(paste0(mySample,": data not found")) }
+  gc()
+}
+
+df_nasal@meta.data$time_point_factor <- factor(df_nasal@meta.data$time_point,levels=c("D-1","D1","D3","D5","D7","D10","D14"))
+```
+
+```{r label="visualise viral reads",fig.width=10,fig.height=5}
+df_nasal$covid_status_factor <- factor(df_nasal$covid_status,levels=c("Abortive infection","Transient infection","Sustained infection"))
+ggplot(df_nasal@meta.data[df_nasal@meta.data$viral_abundance_soupx>0,],aes(time_point_factor)) + geom_bar() + scale_x_discrete(drop=FALSE) + facet_wrap(~covid_status_factor,drop = F) + theme_classic()
+```
+
+```{r label="Annotate major cell type compartments", eval=FALSE} 
+(DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + NoLegend() + theme(aspect.ratio = 1))
+(DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="rna_snn_res.1",shuffle = T,cols=randomColor(length(unique(df_nasal$rna_snn_res.1))),pt.size = .001,raster = F,label = T,repel = T) + NoLegend())
+
+df_nasal$cell_compartment <- "Ciliated"
+df_nasal$cell_compartment[df_nasal$rna_snn_res.1%in%c(15,21,14,22)] <- "Tissue resident myeloid"
+df_nasal$cell_compartment[df_nasal$rna_snn_res.1%in%c(8,13,16)] <- "Tissue resident lymphoid"
+df_nasal$cell_compartment[df_nasal$rna_snn_res.1%in%c(17,18,12,7,20)] <- "Secretory"
+
+ggplot(df_nasal@meta.data,aes(time_point_factor,fill=cell_compartment)) + geom_bar(position = "fill") + scale_x_discrete(drop=FALSE) + facet_wrap(~covid_status) + theme_classic()
+```
+
+```{r label="QC filtering and recluster", eval=FALSE}
+table(df_nasal$nCount_RNA<1000)
+table(df_nasal$nCount_RNA<1000,df_nasal$yoshida_level3_predLabel)
+table(df_nasal$percentMito>50,df_nasal$nCount_RNA<1000)
+hist(df_nasal$percentMito,breaks=100)
+table(df_nasal$percentMito>50,df_nasal$yoshida_level3_predLabel)
+
+# Lets remove cells with more than 50% mitochondrial reads
+df_nasal <- subset(df_nasal,cells=rownames(df_nasal@meta.data)[df_nasal$percentMito<50])
+df_nasal <- NormalizeData(df_nasal, assay = "RNA")
+df_nasal <- FindVariableFeatures(df_nasal)
+df_nasal <- ScaleData(df_nasal)
+df_nasal <- RunPCA(df_nasal,reduction.name = "pca_RNA")
+df_nasal <- RunHarmony(df_nasal, group.by.vars = "orig.ident",assay.use = "RNA",reduction = "pca_RNA",reduction.save = "harmony_RNA")
+df_nasal <- RunUMAP(df_nasal,reduction = "harmony_RNA", dims = 1:30,reduction.name = "umapAfterHarmony_RNA",reduction.key='umapAfterHarmony_RNA_')
+df_nasal <- RunUMAP(df_nasal,reduction = "pca_RNA", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapBeforeHarmony_RNA_')
+write_rds(df_nasal,file="/mnt/projects/RL007_challengeStudy/data/df_nasal.fil2.rds",compress = "gz")
+
+DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="orig.ident",shuffle = T,cols=randomColor(length(unique(df_nasal$orig.ident))),pt.size = .001,raster = F) + theme(aspect.ratio = 1) + NoLegend()
+DimPlot(df_nasal,reduction="umapBeforeHarmony_RNA",group.by="yoshida_level3_predLabel",shuffle = T,cols=randomColor(length(unique(df_nasal$yoshida_level3_predLabel))),pt.size = .001,raster = F,label = T,repel = T) + theme(aspect.ratio = 1) + NoLegend()
+FeaturePlot(df_nasal,features="percentMito") + theme(aspect.ratio = 1)
+```
+
+```{r label="annotate nasopharyngeal cells",eval=FALSE}
+# Cell type annotation was highly manual and done in an iterative manner going back and forth between experts and analysts over the course of several months
+# We always take the approach: leiden clustering -> annotation using marker and differential genes -> subset annotation -> leiden clustering -> annotation using marker and differential genes -> subset annotation -> etc 
+# This iterative annotation is performed until no more biologically meaningful differences between clusters is observed (according to experts)
+# Because of the manual and multidisciplinary nature of this process, we only show the typical workflow in this chunck to prevent cluttering of this markdown file with 1000s of lines of annotation code repetitions
+# Also see the PBMC processing rmd for another example
+
+nasal_markers_vector <- c("Ciliated 1" = "PIFO", 
+                          "Ciliated 1" = "OMG", 
+                          "SAA1",
+                          "SAA2",
+                          "SAA4",
+                          "HLA-DRA",
+                          "HLA-DRB1",
+                          Infected = "VIRAL-SARS-CoV2",  
+                          "IFN" = "IFI44L",  
+                          "IFN" = "MX2", 
+                          "Basal 1" = "DLK2", 
+                          "Basal 1" = "KRT15", 
+                          "Basal 1" = "KRT5", 
+                          "Basal 2" = "DAPL1", 
+                          "Basal 2" = "NOTCH1",  
+                          "Cycling basal" = "MKI67", 
+                          "Cycling basal" = "NUSAP1", 
+                          Club = "SCGB3A1", 
+                          Club = "SCGB1A1", 
+                          Deuterosomal = "FOXN4", 
+                          Deuterosomal = "CDC20B",  
+                          Duct = "RARRES1",  
+                          Duct = "MIA", 
+                          "Goblet 1" = "TFF3", 
+                          "Goblet 1" = "MUC5AC",  
+                          "Goblet 1" = "MUC5B", 
+                          "Goblet 1" = "TFF1", 
+                          "Goblet 1" = "MUC2",  
+                          "Goblet 2 BPIFA2" = "BPIFA2", 
+                          "Goblet 2 PLAU" = "PLAU", 
+                          Hillock = "KRT14",  
+                          Hillock = "KRT6A", 
+                          Hillock = "KRT13", 
+                          Ionocyte = "FOXI1", 
+                          Ionocyte = "ASCL3",  
+                          Melanocyte = "PMEL", 
+                          Melanocyte = "MLANA",
+                          Secretory = "NOS2", 
+                          Secretory = "CAPN13", 
+                          Secretory = "PIGR", 
+                          Squamous = "KRT78", 
+                          Squamous = "SPRR3")
+
+nasal_markers_vector <- as.character(nasal_markers_vector)
+
+nasalImmuneMarkers <- unique(c(
+ "CD19",
+ "MS4A1",
+ "IGHA2",
+ "IGHD",
+ "IGHG1",
+ "IGHM",
+ "NCR1",
+ "NCAM1",
+ "GNLY",
+ "abTCR",
+ "CD3D",
+"CD4",
+"CD8A",
+ "CD38",
+"LEF1",
+ "IL7R",
+'ITGAE',
+ "GZMH",
+ "GZMK",
+ "GZMA",
+ "GZMB",
+ "PRF1",
+ "TRGV9",
+ "TRDV2",
+ "TRDV1",
+ "TRDV3",
+ "TRAV1-2",
+ "SLC4A10",
+ "FOXP3",
+ "IL2RA",
+ "FCER1G",
+ "AXL",
+ "SIGLEC6",
+"LAMP3",
+ "CLEC9A",
+'NR4A3','CLEC10A','FCER1A',
+'CD207','CD1C',
+'C1QA',
+'CXCL10',
+"HLA-DRA",
+"HLA-DRB1",
+'TREM2',
+'MT1G',
+'HDC','TPSAB1',
+'CD14','VCAN','S100A8','S100A9',
+ "CLEC4C",
+ "IL3RA",
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+  ))
+
+df_subset <- subset(df_nasal,cells=colnames(df_nasal)[df_nasal$cell_compartment=="Secretory"])
+
+df_subset <- FindVariableFeatures(df_subset,nfeatures=1000)
+df_subset <- ScaleData(df_subset)
+df_subset <- RunPCA(df_subset,reduction.name = "pca_RNA_1000hvgs")
+df_subset <- RunUMAP(df_subset,reduction = "pca_RNA_1000hvgs", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA_1000hvgs", reduction.key = 'umapBeforeHarmony_RNA_1000hvgs_')
+df_subset <- FindNeighbors(df_subset, dims = 1:30,reduction = "pca_RNA_1000hvgs",graph.name="rna_snn_1000hvgs")
+df_subset <- FindClusters(df_subset, graph.name = "rna_snn_1000hvgs", resolution = c(4),algorithm = 4,method="igraph")
+df_subset <- FindClusters(df_subset, graph.name = "rna_snn_1000hvgs", resolution = c(10),algorithm = 4,method="igraph")
+
+DimPlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",group.by = "orig.ident") + NoLegend()
+DimPlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",group.by = "rna_snn_res.4",label = T,raster = F) + NoLegend()
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "MUC5AC",max.cutoff = "q90",raster = F,order = T)
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "CD3D",max.cutoff = "q90",raster = F,order = T)
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "viral_abundance_soupx",max.cutoff = "q90",raster = F,order = T)
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "nCount_RNA",max.cutoff = "q90",raster = F,order = T)
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "nFeature_RNA",max.cutoff = "q90",raster = F,order = T)
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = c('HIST1H1E', 'SFTPC') ,order=T,max.cutoff = "q90")
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = c('PIFO', 'OMG', 'FOXJ1') ,order=T,max.cutoff = "q90")
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = c('CFAP54', 'CCDC40'),order=T,max.cutoff = "q90")
+
+DotPlot(df_subset,features = nasal_markers_vector,group.by = "rna_snn_res.4",cluster.idents = F,scale.max = 50) + RotatedAxis()
+
+df_subset$annotation_1 <- "Secretory other"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(30,6)] <- "Deutorosomal"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(58,56)] <- "Possibly missed ciliated"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(45,48)] <- "Basal cycling"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(2,3)] <- "Basal 1"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(55)] <- "Doublet"
+df_subset$annotation_1[df_subset$rna_snn_res.4%in%c(57)] <- "Ductal"
+DimPlot(df_subset,reduction = "umapBeforeHarmony_RNA",group.by = "annotation_1",cols = randomColor(length(unique(df_subset$annotation_1))),label=T)
+DotPlot(df_subset,features = nasal_markers_vector,group.by = "annotation_1",cluster.idents = F,scale.max = 50) + RotatedAxis()
+
+
+cols <- randomColor(length(unique(df_subset$yoshida_level3_predLabel)))
+DimPlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",group.by = "yoshida_level3_predLabel",label=T,cols = cols) + NoLegend()
+cols <- randomColor(length(unique(df_subset$annotation_1)))
+DimPlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",group.by = "annotation_1",label=T,cols = cols) + NoLegend()
+FeaturePlot(df_subset,reduction = "umapBeforeHarmony_RNA_1000hvgs",features = "viral_abundance_soupx",max.cutoff = "q90",raster = F,order = T)
+
+df_subset2 <- subset(df_subset,cells=colnames(df_subset)[df_subset$annotation_1=="Secretory other"])
+df_subset2 <- NormalizeData(df_subset2, assay = "RNA")
+df_subset2 <- FindVariableFeatures(df_subset2,nfeatures=1000) 
+df_subset2 <- ScaleData(df_subset2)
+df_subset2 <- RunPCA(df_subset2,reduction.name = "pca_RNA")
+df_subset2 <- RunUMAP(df_subset2,reduction = "pca_RNA", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapBeforeHarmony_RNA_')
+df_subset2 <- FindNeighbors(df_subset2, dims = 1:30,reduction = "pca_RNA",graph.name="rna_snn")
+df_subset2 <- FindClusters(df_subset2, graph.name = "rna_snn", resolution = c(4),algorithm = 4,method="igraph")
+
+# Etc...
+```
+
+```{r label="add annotated subsets to full object",eval=FALSE}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.fil2.rds")
+df_lymphoid <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident lymphoid cells.rds")
+df_ciliated <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Ciliated cells.rds")
+df_secretory <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Secretory cells.rds")
+df_cycling <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_cycling2.rds")
+df_ionocytes <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Ionocytes cells.rds")
+df_b <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident lymphoid cells.B_cells.rds")
+df_mast <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.mast.rds")
+df_melanocytes <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.melNeuro.rds")
+df_lc <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.lcs.rds")
+df_pdc <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.pDcs.rds")
+df_monoCDC <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.monosAndDcs.rds")
+df_mac <- read_rds("/mnt/projects/RL007_challengeStudy/data/df.Nasal resident myeloid cells.macrophages.rds")
+
+df_nasal$annotation_1 <- NA
+df_nasal@meta.data[colnames(df_lymphoid),"annotation_1"] <- df_lymphoid$annotation_1
+df_nasal@meta.data[colnames(df_ciliated),"annotation_1"] <- df_ciliated$annotation_1
+df_nasal@meta.data[colnames(df_secretory),"annotation_1"] <- df_secretory$annotation_1
+df_nasal@meta.data[colnames(df_cycling),"annotation_1"] <- df_cycling$annotation_1
+df_nasal@meta.data[colnames(df_ionocytes),"annotation_1"] <- df_ionocytes$annotation_1
+
+df_nasal@meta.data[colnames(df_b),"annotation_1"] <- df_b$annotation_3
+df_nasal@meta.data[colnames(df_mast),"annotation_1"] <- df_mast$annotation_1
+df_nasal@meta.data[colnames(df_melanocytes),"annotation_1"] <- df_melanocytes$annotation_1
+df_nasal@meta.data[colnames(df_lc),"annotation_1"] <- df_lc$annotation_1
+df_nasal@meta.data[colnames(df_pdc),"annotation_1"] <- df_pdc$annotation_2
+df_nasal@meta.data[colnames(df_monoCDC),"annotation_1"] <- df_monoCDC$annotation_2
+df_nasal@meta.data[colnames(df_mac),"annotation_1"] <- df_mac$annotation_1
+
+df_nasal$cell_state <- df_nasal$annotation_1
+```
+
+```{r label="download nasal VDJ data",eval=FALSE}
+firstManis <- read.csv("/mnt/projects/RL007_challengeStudy/data/samplesReady_nasalSwabsGex_49_031121.txt",stringsAsFactors = F,header = F)
+secondManis <- read.csv("/mnt/projects/RL007_challengeStudy/data/sampleIds_allNasalGexQ6.txt",stringsAsFactors = F,header = F)
+manis <- rbind(firstManis,secondManis)
+colnames(manis) <- "gexId"
+
+myPoolIds <- df_nasal$sample_id[!duplicated(df_nasal$orig.ident)]
+names(myPoolIds) <- df_nasal$orig.ident[!duplicated(df_nasal$orig.ident)]
+
+manis$pool_id <- myPoolIds[manis$gexId]
+outDir <- "/mnt/projects/RL007_challengeStudy/data"
+
+nasalBcr <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/nasal_bcrs.txt",sep = "\t",header = F,stringsAsFactors = F)
+nasalBcr$pool_id <- gsub("(.*)_B","\\1",nasalBcr$V2)
+colnames(nasalBcr) <- c("bcrId","bcrName","pool_id")
+rownames(nasalBcr) <- nasalBcr$pool_id
+manis$bcrId <- nasalBcr[manis$pool_id,"bcrId"]
+df_nasal$bcrId <- nasalBcr[df_nasal$sample_id,"bcrId"]
+
+nasalTcr <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/nasal_tcrs.txt",sep = "\t",header = F,stringsAsFactors = F)
+nasalTcr$pool_id <- nasalTcr$V2
+colnames(nasalTcr) <- c("tcrId","tcrName","pool_id")
+rownames(nasalTcr) <- nasalTcr$pool_id
+manis$tcrId <- nasalTcr[manis$pool_id,"tcrId"]
+df_nasal$tcrId <- nasalTcr[df_nasal$sample_id,"tcrId"]
+
+for (i in 1:nrow(manis)) {
+  cat(manis$gexId[i])
+  if (!dir.exists(paste0(outDir,"/tcr/",manis$tcrId[i]))) { dir.create(paste0(outDir,"/tcr/",manis$tcrId[i])) }
+  if (!dir.exists(paste0(outDir,"/bcr/",manis$bcrId[i]))) { dir.create(paste0(outDir,"/bcr/",manis$bcrId[i])) }
+  try(system(paste0("iget -r /archive/HCA/10X-VDJ/",manis$bcrId[i],"/ig/filtered_contig.fasta /archive/HCA/10X-VDJ/",manis$bcrId[i],"/ig/filtered_contig_annotations.csv ",outDir,"/bcr/",manis$bcrId[i])))
+  try(system(paste0("iget -r /archive/HCA/10X-VDJ/",manis$tcrId[i],"/tr/filtered_contig.fasta /archive/HCA/10X-VDJ/",manis$tcrId[i],"/tr/filtered_contig_annotations.csv ",outDir,"/tcr/",manis$tcrId[i])))
+  cat("\n\n")
+}
+
+```
+
+```{python label='run scirpy to add nasal vdj',eval=FALSE}
+# py_install(pip = T,packages = "scirpy")
+import sys
+import warnings
+
+import numpy as np
+import pandas as pd
+import pandas
+
+import scanpy as sc
+import scirpy as ir
+from matplotlib import pyplot as plt
+import seaborn as sns
+import matplotlib.pyplot as plt
+import scipy.stats
+import scipy as sp
+import anndata
+import os
+from glob import glob
+
+meta_GEX_VDJ = r.manis.set_index('bcrId')
+meta_GEX_VDJ = meta_GEX_VDJ[meta_GEX_VDJ["bcrPresent"] == True]
+meta_GEX_VDJ.head(3)
+
+holder = []
+for sample_vdj in meta_GEX_VDJ.index:
+holder.append(ir.io.read_10x_vdj('/mnt/projects/RL007_challengeStudy/data/bcr/'+sample_vdj+'/filtered_contig_annotations.csv'))
+
+sample_gex = meta_GEX_VDJ.loc[sample_vdj, 'gexId']
+holder[-1].obs_names = [sample_gex+'_'+i.split('-')[0] for i in holder[-1].obs_names]
+
+adata_bcr = pd.concat([i.obs for i in holder])
+adata_bcr.to_csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_nasal_221003_fromScirpy.csv")
+
+#Do the same for TCR
+meta_GEX_VDJ = r.manis.set_index('tcrId')
+meta_GEX_VDJ.head(3)
+
+holder = []
+
+for sample_vdj in meta_GEX_VDJ.index:
+holder.append(ir.io.read_10x_vdj('/mnt/projects/RL007_challengeStudy/data/tcr/'+sample_vdj+'/filtered_contig_annotations.csv'))
+
+sample_gex = meta_GEX_VDJ.loc[sample_vdj, 'gexId']
+holder[-1].obs_names = [sample_gex+'_'+i.split('-')[0] for i in holder[-1].obs_names]
+
+adata_tcr = pd.concat([i.obs for i in holder])
+adata_tcr.to_csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_nasal_221003_fromScirpy.csv")
+```
+
+```{r label="import nasal VDJ data",eval=FALSE}
+myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_nasal_221003_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myBcrs <- myBcrs[myBcrs$X%in%rownames(df_nasal),]
+colnames(myBcrs) <- paste0(colnames(myBcrs),"_bcr")
+
+df_nasal[myBcrs$X,colnames(myBcrs)[!colnames(myBcrs)%in%c(colnames(df),"X_bcr")]] <- myBcrs[,!colnames(myBcrs)%in%c(colnames(df),"X_bcr")]
+
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_nasal_221003_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myTcrs <- myTcrs[myTcrs$X%in%rownames(df_nasal),]
+colnames(myTcrs) <- paste0(colnames(myTcrs),"_tcr")
+
+df_nasal[myTcrs$X,colnames(myTcrs)[!colnames(myTcrs)%in%c(colnames(df),"X_tcr")]] <- myTcrs[,!colnames(myTcrs)%in%c(colnames(df),"X_tcr")]
+
+write_rds(df_nasal,file="/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal_vdj.fil5.rds",compress = "gz")
+write.table(df_nasal,file="/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal_vdj.fil5.tsv",col.names = T,row.names = T,sep = "\t")
+```

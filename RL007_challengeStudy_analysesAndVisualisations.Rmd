@@ -1,0 +1,2845 @@
+---
+title: "RL007_challengeStudy_clean"
+author: "Rik G.H. Lindeboom"
+date: "29/03/2023"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.height = 7, fig.width = 7)
+```
+
+```{r load required packages, echo=FALSE}
+set.seed(1)
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(harmony))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(sceasy))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(SoupX))
+suppressPackageStartupMessages(library(rvcheck))
+suppressPackageStartupMessages(library(cardelino))
+loompy <- reticulate::import('loompy')
+suppressPackageStartupMessages(library(randomcoloR))
+suppressPackageStartupMessages(library(circlize))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(numDeriv))
+suppressPackageStartupMessages(library(Rsamtools))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(glmmSeq))
+suppressPackageStartupMessages(library(future))
+source("/mnt/scripts/function_collection_rik.R")
+source("/mnt/scripts/glmm_functions_Rik.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Forest.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/getCondVal.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/col.rb.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/drawDendrogram.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Dotplot.R")
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(leiden))
+suppressPackageStartupMessages(library(ggseqlogo))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ggh4x))
+```
+
+```{r label="load final pbmc object to run without remaking object"}
+df_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmc.fil2.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+df_pbmc@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_pbmc@meta.data),] 
+df_pbmc <- NormalizeData(df_pbmc, assay = "ADT")
+rm(dfMeta)
+```
+
+```{r label="load final nasopharyngeal object to run without remaking object"}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.fil4.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+df_nasal@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_nasal@meta.data),] 
+rm(dfMeta)
+```
+
+```{r label="extract SARS-CoV-2 reads to visualize distribution",eval=FALSE}
+for (i in unique(df$orig.ident[df$viral_abundance_raw>0])) {
+  cat(i)
+  if (!file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/viralReads/",i,".viralReads.txt"))) { 
+    system(paste0("iget /archive/HCA/10X/",i,"/starsolo/Aligned.sortedByCoord.out.bam /mnt/projects/RL007_challengeStudy/"))
+    system("samtools index -@ 15 /mnt/projects/RL007_challengeStudy/Aligned.sortedByCoord.out.bam")
+    system("samtools view -b /mnt/projects/RL007_challengeStudy/Aligned.sortedByCoord.out.bam NC_045512.2 > /mnt/projects/RL007_challengeStudy/viralOnly.bam")
+    system("java -jar /home/ubuntu/bin/picard/picard.jar MarkDuplicates INPUT=/mnt/projects/RL007_challengeStudy/viralOnly.bam OUTPUT=/mnt/projects/RL007_challengeStudy/viralOnly.rmdup.bam REMOVE_DUPLICATES=true ASSUME_SORTED=true METRICS_FILE=/mnt/projects/RL007_challengeStudy/temp.txt")
+    system("samtools index -@ 15 /mnt/projects/RL007_challengeStudy/viralOnly.rmdup.bam")
+    myBam <- readGAlignments("/mnt/projects/RL007_challengeStudy/viralOnly.rmdup.bam", param=ScanBamParam(tag=c("CB"), what="flag"))
+    myBamDf <- as.data.frame(myBam)
+    write.table(myBamDf,file = paste0("/mnt/projects/RL007_challengeStudy/data/viralReads/",i,".viralReads.txt"),sep = "\t",quote = F,col.names = T,row.names = F)
+    file.remove(c("/mnt/projects/RL007_challengeStudy/Aligned.sortedByCoord.out.bam","/mnt/projects/RL007_challengeStudy/Aligned.sortedByCoord.out.bam.bai","/mnt/projects/RL007_challengeStudy/viralOnly.bam","/mnt/projects/RL007_challengeStudy/viralOnly.rmdup.bam.bai","/mnt/projects/RL007_challengeStudy/viralOnly.rmdup.bam","/mnt/projects/RL007_challengeStudy/temp.txt"))
+    cat("\n\n")
+  }
+}
+```
+
+```{r label="visualise SARS-CoV-2 read distribution"}
+for (i in unique(df_nasal$orig.ident[df_nasal$viral_abundance_raw>0])) {
+  tempReads <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/data/viralReads/",i,".viralReads.txt"),header = T,stringsAsFactors = F,sep = "\t")
+  tempReads <- tempReads[!is.na(tempReads$CB),]
+  tempReads$barcode <- paste0(i,"_",tempReads$CB)
+  if (exists("viralReads")) {
+    viralReads <- rbind(viralReads,tempReads)
+  } else { viralReads <- tempReads }
+}
+
+df_nasal$refinedCompartments <- df_nasal$cell_compartment
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("T CD8")] <- "T CD8"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Macrophage")] <- "Macrophage"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Secretory","Goblet")] <- "Goblet/Secretory"
+
+sarsCovGtf <- read.csv("/mnt/projects/RL001_general/checkReadDistSarscov2/sarsCov2_ncbiGenes_fromUcsc_210817.txt",header = F,stringsAsFactors = F,sep = "\t")
+sarsCovGtf$transcriptId <- gsub(".*transcript_id (.*?);","\\1",sarsCovGtf$V9)
+sarsCovGtf <- sarsCovGtf[sarsCovGtf$V3=="CDS",]
+sarsCovGtf$V4[grepl("ORF1a",sarsCovGtf$transcriptId)] <- min(sarsCovGtf$V4[grepl("ORF1a",sarsCovGtf$transcriptId)])
+sarsCovGtf$V5[grepl("ORF1a",sarsCovGtf$transcriptId)] <- max(sarsCovGtf$V5[grepl("ORF1a",sarsCovGtf$transcriptId)])
+sarsCovGtf <- sarsCovGtf[!duplicated(sarsCovGtf$transcriptId) & sarsCovGtf$transcriptId!="ORF1a ",]
+sarsCovGtf$transcriptId <- gsub(" ","",sarsCovGtf$transcriptId)
+
+myViral <- viralReads[viralReads$barcode%in%rownames(df_nasal@meta.data),]
+myViral[,c("cell_type","cell_state","cell_compartment","refinedCompartments","yoshida_level2_predLabel","yoshida_level3_predLabel","percentMito","sample_id","patient_id","covid_status","viral_abundance_soupx","viral_abundance_raw","time_point_factor","IFN_Stimulation1","cell_type_compartment")] <- df_nasal@meta.data[myViral$barcode,c("cell_type","cell_state","cell_compartment","refinedCompartments","yoshida_level2_predLabel","yoshida_level3_predLabel","percentMito","sample_id","patient_id","covid_status","viral_abundance_soupx","viral_abundance_raw","time_point_factor","IFN_Stimulation1")]
+
+myViral_fil <- myViral[myViral$refinedCompartments%in%c("T CD8","Macrophage","Goblet/Secretory","Ciliated"),]
+
+binWidth <- 1000
+myViral_fil$annotation <- myViral_fil$cell_type
+myViral_fil$annotation[grep("Hijacked",myViral_fil$cell_state)] <- paste(myViral_fil$annotation[grep("Hijacked",myViral_fil$cell_state)],"Hijacked")
+#myTable <- table(myViral_fil$annotation)
+df_nasal$cell_type_wHijacked <- df_nasal$cell_type
+df_nasal$cell_type_wHijacked[grep("Hijacked",df_nasal$cell_state)] <- paste(df_nasal$cell_type[grep("Hijacked",df_nasal$cell_state)],"Hijacked")
+myTable <- table(df_nasal$cell_type_wHijacked)
+myViral_fil$annotation_n <- myTable[myViral_fil$annotation]
+
+myHist <- data.frame(bin=(0:floor(max(sarsCovGtf$V5)/binWidth)),stringsAsFactors=F)
+myHist[,unique(myViral_fil$annotation)] <- NA
+for (cell_type in colnames(myHist)[2:ncol(myHist)]) {
+  myHist[,cell_type] <- sapply(myHist$bin, function(x) { sum(myViral_fil$start[myViral_fil$annotation==cell_type]>=(x*binWidth) & myViral_fil$start[myViral_fil$annotation==cell_type]<((x*binWidth)+(binWidth-1))) })
+}
+myHistLong <- pivot_longer(myHist,cols=colnames(myHist)[2:ncol(myHist)])
+myHistLong_norm <- myHistLong
+myHistLong_norm$value <- as.numeric(myHistLong_norm$value/myTable[myHistLong_norm$name]*1000)
+myHistLong_norm$name <- factor(myHistLong_norm$name,levels=c("Ciliated","Goblet","Secretory","Macrophage","T CD8"))
+
+ggplot(myHistLong_norm,aes(x=bin,y=value)) + geom_bar(stat = "identity") + geom_smooth(se=F) + facet_wrap(~name) + theme_classic() + ylab(paste("SARS-CoV-2 reads /",binWidth,"nt / 1000 cells"))
+
+counter <- nrow(sarsCovGtf)
+plot(1,type="n",xlim=c(-4000,30000),ylim=c(0,counter),xlab="SARS-CoV-2 genome (nt)")
+for (i in 1:nrow(sarsCovGtf)) {
+  lines(c(sarsCovGtf$V4[i],sarsCovGtf$V5[i]),c(counter,counter))
+  text(0,counter,sarsCovGtf$transcriptId[i],adj = 1)
+  counter <- counter-1
+}
+
+```
+
+```{r label="BCR analysis to find activated BCR clonotypes prepare data"}
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myBcrs <- myBcrs[paste0(myBcrs$X,"-1")%in%rownames(dfMeta),]
+
+dfMeta[paste0(myBcrs$X,"-1"),colnames(myBcrs)[!colnames(myBcrs)%in%c(colnames(df),"X")]] <- myBcrs[,!colnames(myBcrs)%in%c(colnames(df),"X")]
+
+dfMeta <- dfMeta[!is.na(dfMeta$IR_VJ_1_cdr3) & !is.na(dfMeta$IR_VDJ_1_cdr3) & dfMeta$IR_VDJ_1_cdr3!="" & dfMeta$IR_VJ_1_cdr3!="" & dfMeta$cell_compartment%in%c("B ABS","B"),]
+
+dfMeta$clonotype_aa <- paste0(dfMeta$IR_VJ_1_cdr3,"_",dfMeta$IR_VDJ_1_cdr3)
+dfMeta$clonotype_nt <- paste0(dfMeta$IR_VJ_1_cdr3_nt,"_",dfMeta$IR_VDJ_1_cdr3_nt)
+myNames <- dfMeta$clonotype_aa[!duplicated(dfMeta$clonotype_aa)]
+```
+
+```{r label="BCR analysis to find activated BCR clonotypes: first find best distance theshold",eval=FALSE}
+allBcrsH <- dfMeta$IR_VDJ_1_cdr3[!duplicated(dfMeta$clonotype_aa)]
+allBcrsL <- dfMeta$IR_VJ_1_cdr3[!duplicated(dfMeta$clonotype_aa)]
+lvDistsH <- as.data.frame(stringdist::stringdistmatrix(allBcrsH,allBcrsH,method = "lv",nthread = 19))
+lvDistsL <- as.data.frame(stringdist::stringdistmatrix(allBcrsL,allBcrsL,method = "lv",nthread = 19))
+
+rownames(lvDistsH) <- myNames
+colnames(lvDistsH) <- myNames
+rownames(lvDistsL) <- myNames
+colnames(lvDistsL) <- myNames
+
+thresholdToTest <- 1:20
+purityTable <- data.frame(threshold=thresholdToTest,purity=NA,purity_naive=NA,stringsAsFactors = F)
+threshold <- 2
+testThresholds <- T
+for (threshold in purityTable$threshold) {
+  print(threshold)
+  gc()
+  lvDists <- lvDistsH+lvDistsL
+  gc()
+  lvDists <- ifelse(lvDists<=threshold,1,0)
+  gc()
+  lvDists[row(lvDists)==col(lvDists)] <- 0
+  gc()
+  
+  rownames(lvDists) <- myNames
+  colnames(lvDists) <- myNames
+  gc()
+  myNames_fil <- myNames[rowSums(lvDists)>0]
+  gc()
+  lvDists <- lvDists[rowSums(lvDists)>0,colSums(lvDists)>0]
+  gc()
+  
+  myGraph <- graph_from_adjacency_matrix(as.matrix(lvDists))
+  rm(lvDists)
+  gc()
+
+  partition <- leiden(myGraph,resolution_parameter = 1)
+  names(partition) <- myNames_fil
+  
+  dfMeta$clonotype_cluster <- partition[dfMeta$clonotype_aa]
+  dfMeta$clonotype_cluster[is.na(dfMeta$clonotype_cluster)] <- "single"
+  
+  node.cols <- distinctColorPalette(length(unique(partition)))[partition]
+  #plot(myGraph, vertex.color = node.cols,vertex.size=4,
+  #     vertex.label.dist=0.5, vertex.color="red", edge.arrow.size=0.5,vertex.label=NA)
+
+  if (testThresholds) {
+  # Judge purity by patient sharing
+  clonotypeN <- table(dfMeta$clonotype_cluster[!duplicated(dfMeta$clonotype_aa)])
+  clusterPurity <- sapply(names(clonotypeN)[clonotypeN>1],function(x) {
+    myTable <- table(dfMeta$patient_id[dfMeta$clonotype_cluster==x & !duplicated(dfMeta$clonotype_aa)])
+    as.numeric(myTable[names(myTable)[myTable==max(myTable)]]/sum(myTable))[1]
+  })
+  purityTable[purityTable$threshold==threshold,"purity"] <- mean(clusterPurity[names(clusterPurity)!="single"])
+  }
+
+  # Judge purity by naive b cell contamination
+  clusterPurity_naive <- sapply(names(clonotypeN)[clonotypeN>1],function(x) {
+    sum(dfMeta$cell_type[dfMeta$clonotype_cluster==x & !duplicated(dfMeta$clonotype_aa)]=="B Naive")/sum(dfMeta$clonotype_cluster==x & !duplicated(dfMeta$clonotype_aa))
+  })
+  purityTable[purityTable$threshold==threshold,"purity_naive"] <- mean(clusterPurity_naive[names(clusterPurity_naive)!="single"])
+  write_rds(purityTable,file="/mnt/projects/RL007_challengeStudy/data/purityTable_bcells.rds")
+  }
+}
+```
+
+```{r label="BCR analysis to find activated BCR clonotypes: visualise best distance theshold"}
+purityTable <- read_rds("/mnt/projects/RL007_challengeStudy/data/purityTable_bcells.rds")
+purityTable <- purityTable[!is.na(purityTable$purity),]
+plot(purityTable$threshold,1-purityTable$purity,xlab="lv distance threshold",ylab="proportion patient sharing within clonotype")
+plot(purityTable$threshold,purityTable$purity_naive,xlab="lv distance threshold",ylab="proportion naive B cell contamination within clonotype")
+```
+
+```{r label="BCR analysis to find activated BCR clonotypes: visualise results",fig.height=10,fig.width=7}
+# theshold of 2 won
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myBcrs <- myBcrs[paste0(myBcrs$X,"-1")%in%rownames(dfMeta),]
+
+dfMeta[paste0(myBcrs$X,"-1"),colnames(myBcrs)[!colnames(myBcrs)%in%c(colnames(df),"X")]] <- myBcrs[,!colnames(myBcrs)%in%c(colnames(df),"X")]
+
+dfMeta <- dfMeta[!is.na(dfMeta$IR_VJ_1_cdr3) & !is.na(dfMeta$IR_VDJ_1_cdr3) & dfMeta$IR_VDJ_1_cdr3!="" & dfMeta$IR_VJ_1_cdr3!="" & dfMeta$cell_compartment%in%c("B ABS","B"),]
+
+dfMeta$clonotype_aa <- paste0(dfMeta$IR_VJ_1_cdr3,"_",dfMeta$IR_VDJ_1_cdr3)
+dfMeta$clonotype_nt <- paste0(dfMeta$IR_VJ_1_cdr3_nt,"_",dfMeta$IR_VDJ_1_cdr3_nt)
+myNames <- dfMeta$clonotype_aa[!duplicated(dfMeta$clonotype_aa)]
+
+threshold <- 2
+testThresholds <- F
+print(threshold)
+gc()
+lvDistsH <- read_rds("/mnt/projects/RL007_challengeStudy/data/bcrH_lvDistances.rds")
+lvDistsL <- read_rds("/mnt/projects/RL007_challengeStudy/data/bcrL_lvDistances.rds")
+lvDists <- lvDistsH+lvDistsL
+rm(lvDistsH)
+rm(lvDistsL)
+rm(df_nasal)
+gc()
+lvDists <- ifelse(lvDists<=threshold,1,0)
+gc()
+lvDists[row(lvDists)==col(lvDists)] <- 0
+gc()
+
+rownames(lvDists) <- myNames
+colnames(lvDists) <- myNames
+gc()
+myNames_fil <- myNames[rowSums(lvDists)>0]
+gc()
+lvDists <- lvDists[rowSums(lvDists)>0,colSums(lvDists)>0]
+gc()
+
+myGraph <- graph_from_adjacency_matrix(as.matrix(lvDists))
+rm(lvDists)
+gc()
+
+partition <- leiden(myGraph,resolution_parameter = 1)
+names(partition) <- myNames_fil
+
+dfMeta$clonotype_cluster <- partition[dfMeta$clonotype_aa]
+dfMeta$clonotype_cluster[is.na(dfMeta$clonotype_cluster)] <- "single"
+
+
+dfMeta$clonotype_aa_nchar <- nchar(dfMeta$clonotype_aa)
+
+
+infFraction <- sapply(names(table(dfMeta$clonotype_cluster)[table(dfMeta$clonotype_cluster)>2]),function(x) sum(dfMeta$covid_status[dfMeta$clonotype_cluster==x]=="Sustained infection")/sum(dfMeta$clonotype_cluster==x))
+absFraction <- sapply(names(table(dfMeta$clonotype_cluster)[table(dfMeta$clonotype_cluster)>2]),function(x) sum(dfMeta$cell_compartment[dfMeta$clonotype_cluster==x]=="B ABS")/sum(dfMeta$clonotype_cluster==x))
+
+matureFraction <- sapply(names(table(dfMeta$clonotype_cluster)[table(dfMeta$clonotype_cluster)>2]),function(x) sum(dfMeta$cell_type[dfMeta$clonotype_cluster==x]!="B Naive")/sum(dfMeta$clonotype_cluster==x))
+
+# COVID-19 specific clones are super enriched for abs cells
+bcrFractionPlot <- ggplot(data=data.frame(infFraction=infFraction,absFraction=absFraction),aes(absFraction,x=infFraction)) + geom_jitter(width = .02,height=.02,alpha = 0.25) + theme_classic(base_family = "Helvetica") + theme(aspect.ratio = 1) + xlab("fraction clonotype in infected individuals") + ylab("fraction clonotype in antibody secreting cells")
+bcrFractionPlot
+
+# So if you select clonotype clusters with at least 3 cells that contain a ABS cell, you're exclusively selecting covid specific
+plotList <- list()
+for (i in names(table(dfMeta$clonotype_cluster))[table(dfMeta$clonotype_cluster)>2]){
+  if (i %in% names(absFraction)[absFraction>.2]) {
+    mostCommonNchar <- names(table(nchar(dfMeta$clonotype_aa[dfMeta$clonotype_cluster==i])))[table(nchar(dfMeta$clonotype_aa[dfMeta$clonotype_cluster==i]))==max(table(nchar(dfMeta$clonotype_aa[dfMeta$clonotype_cluster==i])))][1]
+    plotList[[i]] <- dfMeta$clonotype_aa[dfMeta$clonotype_cluster==i & dfMeta$clonotype_aa_nchar==as.numeric(mostCommonNchar)]
+    #plotList[[i]] <- ggseqlogo( dfMeta$clonotype_aa[dfMeta$clonotype_cluster==i & dfMeta$clonotype_aa_nchar==as.numeric(mostCommonNchar)], seq_type='aa',)
+  }
+}
+ggseqlogo(plotList,scales="free",ncol=2)
+
+ggplot(data=data.frame(matureFraction=matureFraction,absFraction=absFraction),aes(absFraction,x=matureFraction)) + geom_jitter(width = .02,height=.02,alpha = 0.25) + geom_smooth() + theme(aspect.ratio = 1) + theme_classic() + xlab("fraction clonotype is mature B cells") + ylab("fraction clonotype in antibody secreting cells")
+
+# AB isotype usage
+geneUsage <- sapply(names(absFraction)[absFraction>.2],function(x) table(dfMeta$IR_VDJ_1_c_gene[dfMeta$clonotype_cluster==x])/sum(table(dfMeta$IR_VDJ_1_c_gene[dfMeta$clonotype_cluster==x])))
+
+ggplot(data=dfMeta[dfMeta$clonotype_cluster%in%names(absFraction)[absFraction>.2],],aes(x=clonotype_cluster,fill=IR_VDJ_1_c_gene)) + geom_bar(position="fill") + theme_classic()
+
+```
+
+```{r label="BCR figure with time motifs and isotypes",fig.width=10,fig.height=10}
+sigClusters <- names(absFraction)[absFraction>.2]
+
+clonotypeCounts <- as.data.frame.matrix(table(dfMeta$time_point_factor[dfMeta$covid_status=="Sustained infection"],dfMeta$clonotype_cluster[dfMeta$covid_status=="Sustained infection"]))
+props <- as.data.frame(t(clonotypeCounts/rowSums(clonotypeCounts)))
+props$cluster <- rownames(props)
+longProps <- pivot_longer(props,names_to="time_point",values_to="proportion",cols=-cluster)
+longProps$time_point_num <- as.numeric(gsub("D","",longProps$time_point))
+longProps
+
+filLongProps <- longProps[longProps$cluster%in%sigClusters,]
+filLongProps$proportion[filLongProps$proportion!=0] <- filLongProps$proportion[filLongProps$proportion!=0]*(1+rnorm(1:sum(filLongProps$proportion!=0),mean = 0,sd = .2)) # add a bit of noise to make dots visible
+
+nonFilLongProps <- longProps[longProps$cluster!="single" & !longProps$cluster%in%sigClusters,]
+nonFilLongProps$proportion[nonFilLongProps$proportion!=0] <- nonFilLongProps$proportion[nonFilLongProps$proportion!=0]*(1+rnorm(1:sum(nonFilLongProps$proportion!=0),mean = 0,sd = .2))
+
+
+myPlot <- ggplot() + 
+  geom_point(data=nonFilLongProps,aes(time_point_num,proportion,group=cluster,alpha=.01)) + geom_line(data=nonFilLongProps,aes(time_point_num,proportion,group=cluster,alpha=.01)) + 
+  geom_line(data=filLongProps,aes(time_point_num,proportion,col=cluster,alpha=.02),size=2) +
+  geom_point(data=filLongProps,aes(time_point_num,proportion,col=cluster,alpha=.02),size=4) + 
+  scale_color_manual(values=distinctColorPalette(length(unique(filLongProps$cluster)))) + 
+  scale_y_log10() + theme_classic(base_family = "Helvetica") + coord_cartesian(ylim=c(0.00001,1)) + theme(aspect.ratio = 1)
+myPlot
+
+myLegend <- ggseqlogo(plotList[order(names(plotList))],scales="free",ncol=1) + theme_void(base_family = "Helvetica")
+myLegend
+
+igClassBars <- ggplot(data=dfMeta[dfMeta$clonotype_cluster%in%names(absFraction)[absFraction>.2],],aes(x=forcats::fct_rev(clonotype_cluster),fill=IR_VDJ_1_c_gene)) + geom_bar(position="fill") + coord_flip() + theme_classic(base_family = "Helvetica")
+
+myFigure <- myPlot + myLegend + igClassBars + plot_layout(guides = "collect", nrow=1)
+myFigure
+
+```
+
+```{r label="reload final nasopharyngeal object because we needed to remove it to prevent mem issues during the distance calculation above"}
+df_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_nasal.fil4.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+df_nasal@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_nasal@meta.data),] 
+rm(dfMeta)
+```
+
+Here we plot the fraction of annotated IFN stimulated cells over time and cell types
+```{r label="Figure line plot of IFN response"}
+# Highlight IFN stim
+
+df_nasal$cell_type_forIfn <- df_nasal$cell_type
+df_nasal$cell_type_forIfn[grep("IFN",df_nasal$cell_state)] <- paste(df_nasal$cell_type_forIfn[grep("IFN",df_nasal$cell_state)],"IFN stim")
+df_nasal$cell_type_forIfn[!grepl("IFN",df_nasal$cell_state)] <- NA
+
+df_pbmc$cell_type_forIfn <- df_pbmc$cell_type
+df_pbmc$cell_type_forIfn[grepl("IFN",df_pbmc$cell_state)] <- paste(df_pbmc$cell_type_forIfn[grep("IFN",df_pbmc$cell_state)],"IFN stim")
+df_pbmc$cell_type_forIfn[!grepl("IFN",df_pbmc$cell_state)] <- NA
+
+ifnColorsPbmc <- distinctColorPalette(length(unique(c(df_pbmc$cell_type_forIfn,df_pbmc$cell_type_forIfn))))
+ifnColors <- distinctColorPalette(length(unique(c(df_nasal$cell_type_forIfn,df_pbmc$cell_type_forIfn))))
+names(ifnColors) <- unique(c(df_nasal$cell_type_forIfn,df_pbmc$cell_type_forIfn))
+ifnColorsNasal <- distinctColorPalette(length(unique(df_pbmc$cell_type_forIfn)))
+
+ifnPbmc <- DimPlot(df_pbmc,group.by = "cell_type_forIfn", label=T, reduction=paste0("umap_harmony_RNA_wVDJ_30pcs_6000hvgs"), cols = ifnColors,na.value = "lightgrey", label.size = 3, repel = T,raster.dpi = c(2000,2000),pt.size = 2) + theme(aspect.ratio = 1)
+ifnNasal <- DimPlot(df_nasal,group.by = "cell_type_forIfn", label=T, reduction=paste0("umap"), cols = ifnColors,na.value = "lightgrey", label.size = 3, repel = T,raster.dpi = c(2000,2000),pt.size = 2) + theme(aspect.ratio = 1)
+ifnNasal + ifnPbmc + plot_layout(guides="collect",ncol=1)
+
+#Make linegraph nasal
+df_nasal$cell_type_forIfn <- df_nasal$cell_type
+df_nasal$cell_type_forIfn[grep("IFN",df_nasal$cell_state)] <- paste(df_nasal$cell_type_forIfn[grep("IFN",df_nasal$cell_state)],"IFN stim")
+
+df_pbmc$cell_type_forIfn <- df_pbmc$cell_type
+df_pbmc$cell_type_forIfn[grepl("IFN",df_pbmc$cell_state)] <- paste(df_pbmc$cell_type_forIfn[grep("IFN",df_pbmc$cell_state)],"IFN stim")
+
+myDf <- data.frame(patient_id=df_nasal$patient_id[!duplicated(paste(df_nasal$sample_id,df_nasal$cell_type))],
+                   covid_status=df_nasal$covid_status[!duplicated(paste(df_nasal$sample_id,df_nasal$cell_type))],
+                   time_point=df_nasal$time_point[!duplicated(paste(df_nasal$sample_id,df_nasal$cell_type))],
+                   cell_type=df_nasal$cell_type[!duplicated(paste(df_nasal$sample_id,df_nasal$cell_type))],
+                   stringsAsFactors = F)
+
+myDf$fraction_IFN_stim <- apply(myDf,1,function(x) sum(grepl("IFN",df_nasal$cell_state[df_nasal$patient_id==x[1] & df_nasal$covid_status==x[2] & df_nasal$time_point==x[3] & df_nasal$cell_type==x[4]]))/sum(df_nasal$patient_id==x[1] & df_nasal$covid_status==x[2] & df_nasal$time_point==x[3] & df_nasal$cell_type==x[4]))
+
+ifnPerCelltype <- sapply(unique(myDf$cell_type), function(x) sum(myDf$fraction_IFN_stim[myDf$cell_type==x]))
+myDf <- myDf[!myDf$cell_type%in%names(ifnPerCelltype)[ifnPerCelltype==0],]
+
+myDf$time_point_factor <- factor(myDf$time_point,levels=levels(df_nasal$time_point_factor))
+myDf$time_point_numeric <- as.numeric(gsub("D","",myDf$time_point))
+
+table(df_nasal$cell_type[grepl("IFN",df_nasal$cell_state)],df_nasal$time_point_factor[grepl("IFN",df_nasal$cell_state)])  #DC1 only has 1-12 cells in total per time point, which creates spurious 100% timepoints. We remove these to prevent confusion
+myDf <- myDf[myDf$cell_type!="cDC1",]
+
+myDf_mean <- myDf[!duplicated(paste(myDf$cell_type,myDf$covid_status,myDf$time_point)),]
+for (i in myDf$cell_type) {
+  for (status in unique(myDf$covid_status)) {
+    for (time_point in unique(myDf$time_point))
+      myDf_mean$fraction_IFN_stim[myDf_mean$cell_type==i & myDf_mean$covid_status==status & myDf_mean$time_point==time_point] <- mean(myDf$fraction_IFN_stim[myDf$cell_type==i & myDf$covid_status==status & myDf$time_point==time_point])
+  }
+}
+
+
+ggplot(myDf,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type,alpha=.1)) + geom_point() + geom_line(data=myDf_mean,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type)) + facet_wrap(~covid_status) + theme_classic()
+
+
+
+#PBMCs
+myDf_pbmc <- data.frame(patient_id=df_pbmc$patient_id[!duplicated(paste(df_pbmc$sample_id,df_pbmc$cell_type))],
+                        covid_status=df_pbmc$covid_status[!duplicated(paste(df_pbmc$sample_id,df_pbmc$cell_type))],
+                        time_point=df_pbmc$time_point[!duplicated(paste(df_pbmc$sample_id,df_pbmc$cell_type))],
+                        cell_type=df_pbmc$cell_type[!duplicated(paste(df_pbmc$sample_id,df_pbmc$cell_type))],
+                        stringsAsFactors = F)
+
+myDf_pbmc$fraction_IFN_stim <- apply(myDf_pbmc,1,function(x) sum(grepl("IFN",df_pbmc$cell_state[df_pbmc$patient_id==x[1] & df_pbmc$covid_status==x[2] & df_pbmc$time_point==x[3] & df_pbmc$cell_type==x[4]]))/sum(df_pbmc$patient_id==x[1] & df_pbmc$covid_status==x[2] & df_pbmc$time_point==x[3] & df_pbmc$cell_type==x[4]))
+
+ifnPerCelltype <- sapply(unique(myDf_pbmc$cell_type), function(x) sum(myDf_pbmc$fraction_IFN_stim[myDf_pbmc$cell_type==x]))
+myDf_pbmc <- myDf_pbmc[!myDf_pbmc$cell_type%in%names(ifnPerCelltype)[ifnPerCelltype==0],]
+
+myDf_pbmc$time_point_factor <- factor(myDf_pbmc$time_point,levels=levels(df_pbmc$time_point_factor))
+myDf_pbmc$time_point_numeric <- as.numeric(gsub("D","",myDf_pbmc$time_point))
+
+myDf_pbmc_mean <- myDf_pbmc[!duplicated(paste(myDf_pbmc$cell_type,myDf_pbmc$covid_status,myDf_pbmc$time_point)),]
+for (i in myDf_pbmc$cell_type) {
+  for (status in unique(myDf_pbmc$covid_status)) {
+    for (time_point in unique(myDf_pbmc$time_point))
+      myDf_pbmc_mean$fraction_IFN_stim[myDf_pbmc_mean$cell_type==i & myDf_pbmc_mean$covid_status==status & myDf_pbmc_mean$time_point==time_point] <- mean(myDf_pbmc$fraction_IFN_stim[myDf_pbmc$cell_type==i & myDf_pbmc$covid_status==status & myDf_pbmc$time_point==time_point])
+  }
+}
+
+
+names(ifnColors) <- gsub(" IFN stim","",names(ifnColors))
+ifnLine_nose <- ggplot(myDf,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type)) + geom_point(shape=16,alpha=.25) + geom_line(data=myDf_mean,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type)) + facet_wrap(~covid_status,ncol=1) + coord_cartesian(xlim=c(-1,18)) + theme_classic() + scale_color_manual(values = ifnColors)
+
+#Maybe change 28 to 18 to make the scale more equal, we'll change this back in illustrator
+myDf_pbmc$time_point_numeric[myDf_pbmc$time_point_numeric==28] <- 18
+myDf_pbmc_mean$time_point_numeric[myDf_pbmc_mean$time_point_numeric==28] <- 18
+
+ifnLine_pbmc <- ggplot(myDf_pbmc,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type)) + geom_point(shape=16,alpha=.25) + geom_line(data=myDf_pbmc_mean,aes(x=time_point_numeric,y=fraction_IFN_stim,col=cell_type)) + facet_wrap(~covid_status,ncol=1) + coord_cartesian(xlim=c(-1,18)) + theme_classic() + scale_color_manual(values = ifnColors)
+
+ifnLine_pbmc + ifnLine_nose + plot_layout(guides = 'collect',ncol = 1)
+
+# Make a simpler figure of this with just IFN stim vs non stim regardless of cell type
+# Nasal
+myDf <- data.frame(patient_id=df_nasal$patient_id[!duplicated(paste(df_nasal$sample_id))],
+                   covid_status=df_nasal$covid_status[!duplicated(paste(df_nasal$sample_id))],
+                   time_point=df_nasal$time_point[!duplicated(paste(df_nasal$sample_id))],
+                   stringsAsFactors = F)
+
+myDf$fraction_IFN_stim <- apply(myDf,1,function(x) sum(grepl("IFN",df_nasal$cell_state[df_nasal$patient_id==x[1] & df_nasal$covid_status==x[2] & df_nasal$time_point==x[3]]))/sum(df_nasal$patient_id==x[1] & df_nasal$covid_status==x[2] & df_nasal$time_point==x[3]))
+
+myDf$time_point_factor <- factor(myDf$time_point,levels=levels(df_nasal$time_point_factor))
+myDf$time_point_numeric <- as.numeric(gsub("D","",myDf$time_point))
+
+myDf_mean <- myDf[!duplicated(paste(myDf$covid_status,myDf$time_point)),]
+for (status in unique(myDf$covid_status)) {
+  for (time_point in unique(myDf$time_point)) {
+    myDf_mean$fraction_IFN_stim[myDf_mean$covid_status==status & myDf_mean$time_point==time_point] <- mean(myDf$fraction_IFN_stim[myDf$covid_status==status & myDf$time_point==time_point])
+  }
+}
+
+ggplot(myDf,aes(x=time_point_numeric,y=fraction_IFN_stim)) + geom_point() + geom_line(data=myDf_mean,aes(x=time_point_numeric,y=fraction_IFN_stim)) + facet_wrap(~covid_status) + theme_classic()
+
+# PBMCs
+myDfPbmcs <- data.frame(patient_id=df_pbmc$patient_id[!duplicated(paste(df_pbmc$sample_id))],
+                        covid_status=df_pbmc$covid_status[!duplicated(paste(df_pbmc$sample_id))],
+                        time_point=df_pbmc$time_point[!duplicated(paste(df_pbmc$sample_id))],
+                        stringsAsFactors = F)
+
+myDfPbmcs$fraction_IFN_stim <- apply(myDfPbmcs,1,function(x) sum(grepl("IFN",df_pbmc$cell_state[df_pbmc$patient_id==x[1] & df_pbmc$covid_status==x[2] & df_pbmc$time_point==x[3]]))/sum(df_pbmc$patient_id==x[1] & df_pbmc$covid_status==x[2] & df_pbmc$time_point==x[3]))
+
+myDfPbmcs$time_point_factor <- factor(myDfPbmcs$time_point,levels=levels(df_pbmc$time_point_factor))
+myDfPbmcs$time_point_numeric <- as.numeric(gsub("D","",myDfPbmcs$time_point))
+
+myDfPbmcs_mean <- myDfPbmcs[!duplicated(paste(myDfPbmcs$covid_status,myDfPbmcs$time_point)),]
+for (status in unique(myDfPbmcs$covid_status)) {
+  for (time_point in unique(myDfPbmcs$time_point)) {
+    myDfPbmcs_mean$fraction_IFN_stim[myDfPbmcs_mean$covid_status==status & myDfPbmcs_mean$time_point==time_point] <- mean(myDfPbmcs$fraction_IFN_stim[myDfPbmcs$covid_status==status & myDfPbmcs$time_point==time_point])
+  }
+}
+
+ggplot(myDfPbmcs,aes(x=time_point_numeric,y=fraction_IFN_stim)) + geom_point() + geom_line(data=myDfPbmcs_mean,aes(x=time_point_numeric,y=fraction_IFN_stim)) + facet_wrap(~covid_status) + theme_classic()
+
+# Reduce distance to d28 and d14 samples, fix axis in Illustrator
+myDfPbmcs$time_point_numeric[myDfPbmcs$time_point_numeric==28] <- 18
+myDfPbmcs_mean$time_point_numeric[myDfPbmcs_mean$time_point_numeric==28] <- 18
+
+ifnLine_pbmc <- ggplot(myDfPbmcs,aes(x=time_point_numeric,y=fraction_IFN_stim)) + geom_point(shape=16,alpha=.25) + geom_line(data=myDfPbmcs_mean,aes(x=time_point_numeric,y=fraction_IFN_stim)) + facet_wrap(~covid_status,ncol=1) + coord_cartesian(xlim=c(-1,18),ylim = c(0,1)) + theme_classic()
+ifnLine_nose <- ggplot(myDf,aes(x=time_point_numeric,y=fraction_IFN_stim)) + geom_point(shape=16,alpha=.25) + geom_line(data=myDf_mean,aes(x=time_point_numeric,y=fraction_IFN_stim)) + facet_wrap(~covid_status,ncol=1) + coord_cartesian(xlim=c(-1,18),ylim = c(0,1)) + theme_classic()
+
+ifnLine_pbmc + ifnLine_nose + plot_layout(guides = 'collect',ncol = 1)
+
+
+```
+
+```{r label="plot viral reads over time per cell type"}
+df_nasal$refinedCompartments <- "Other"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("T CD8")] <- "T CD8"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Ciliated")] <- "Ciliated"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Macrophage")] <- "Macrophage"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Goblet")] <- "Goblet"
+df_nasal$refinedCompartments[df_nasal$cell_type%in%c("Secretory")] <- "Secretory"
+
+myDf <- FetchData(df_nasal,vars = c("nCount_RNA","time_point_factor","refinedCompartments","viral_abundance_soupx","viral_abundance_raw","covid_status","cell_state","cell_type"),cells = colnames(df_nasal)[df_nasal$viral_abundance_soupx>0])
+myDf$cell_state_woIfn <- gsub(" IFN stim","",myDf$cell_state)
+
+myCols <- distinctColorPalette(length(unique(myDf$refinedCompartments))+1)
+names(myCols) <- c("Ciliated","Ciliated Hijacked","Goblet","Secretory","Macrophage","T CD8","Other")
+myCols <- c(Ciliated = "#90DEBD", "Ciliated Hijacked" = "#BC55DC", Goblet = "#E1BE7A",  Secretory = "#A6E361", Macrophage = "#DD7397", "T CD8" = "#9E8DDA",  Other = "#BAC7D7")
+
+myBarplot <- ggplot(myDf,aes(x=time_point_factor,fill=factor(refinedCompartments,levels=c("Ciliated","Goblet","Secretory","Macrophage","T CD8","Other")))) + geom_bar() + theme_classic(base_family = "Helvetica") + labs(fill="Cell type") + ylab("Amount of cells with SARS-CoV-2 reads") + xlab("Days since inoculation") + scale_fill_manual(values = myCols)
+myBarplot
+
+
+```
+
+
+```{r label="plot markers for activated T MAI cells"}
+
+dfmait <- subset(df_pbmc,cells=colnames(df_pbmc)[df_pbmc$cell_type=="T MAI"])
+DotPlot(dfmait,features = c("PRF1","GZMA","CD27","NKG7"),group.by = "cell_state") + theme(aspect.ratio=2/4,axis.text.x = element_text(size=8,angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r label="Plot responses markers in cilliated cells",fig.width=7,fig.height=7}
+myFeatures <- c("SAA1","IFI44L","MX2","VIRAL-SARS-CoV2","HLA-DRA","HLA-DRB1","HLA-DRB5","HLA-DPA1","HLA-DPB1","HLA-DQA1","CD74","CTSS")
+df_ciliated <- subset(df_nasal,cells=colnames(df_nasal)[df_nasal$cell_type=="Ciliated"])
+Idents(df_ciliated) <- factor(df_ciliated$cell_state,levels=rev(unique(df_ciliated$cell_state))[c(2,1,3,4,5)])
+DotPlot(df_ciliated,features=myFeatures,dot.scale = 3,scale.max = 100) + RotatedAxis() + theme(axis.text.y=element_text(size=8), axis.text.x = element_text(size=8,angle = 90, vjust = 0.5, hjust=1),aspect.ratio=length(unique(df_ciliated$cell_state))/length(myFeatures))
+```
+
+```{r label="Plot relative dynamics of cilliated cells",fig.width=7,fig.height=7}
+df_ciliated <- subset(df_nasal,cells=colnames(df_nasal)[df_nasal$cell_type=="Ciliated"])
+
+myFreqs <- t(as.data.frame.matrix(table(df_ciliated$cell_state,paste(df_ciliated$patient_id,df_ciliated$time_point,df_ciliated$covid_status))))
+myProps <- as.data.frame(myFreqs/rowSums(myFreqs))
+myProps$patient_id <- gsub("(.*) (.*) (.* .*)","\\1",rownames(myProps))
+myProps$time_point <- factor(gsub("(.*) (.*) (.* .*)","\\2",rownames(myProps)),levels=levels(df_ciliated$time_point_factor))
+myProps$covid_status <- gsub("(.*) (.*) (.* .*)","\\3",rownames(myProps))
+myLongProps <- as.data.frame(pivot_longer(myProps,cols=-colnames(myProps)[!colnames(myProps)%in%unique(df_ciliated$cell_state)],names_to = "cell_state",values_to = "fraction"))
+
+
+meanLongProps <- myLongProps[!duplicated(paste(myLongProps$cell_state,myLongProps$covid_status,myLongProps$time_point)),]
+for (i in 1:nrow(meanLongProps)) { 
+  meanLongProps$fraction[i] <- mean(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+  meanLongProps$sd[i] <- sd(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+}
+
+myCols <- df_nasal$cell_state_color[!duplicated(df_nasal$cell_state)]
+names(myCols) <- df_nasal$cell_state[!duplicated(df_nasal$cell_state)]
+myCols <- myCols[grepl("Ciliated",names(myCols))]
+
+myPlot <- ggplot(myLongProps[myLongProps$covid_status=="Sustained infection" & !myLongProps$cell_state%in%c("Ciliated"),], aes(x=factor(gsub("D","",time_point), levels=gsub("D","",levels(df_ciliated$time_point_factor))), y=fraction,col=cell_state)) + geom_boxplot(outlier.shape = NA) + geom_point(position = position_dodge(width=.75),size=1) + scale_color_manual(values=myCols) + xlab("Days since inoculation") + ylab("Fraction of ciliated cells") + theme_classic()# + facet_wrap(~cell_state,ncol=2,scales="free_x")
+myPlot
+
+```
+
+```{r label="Plot relative amount of inflammatory monos",fig.width=7,fig.height=7}
+dfMeta_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+myFreqs <- t(as.data.frame.matrix(table(dfMeta_pbmc$cell_state_woIFN,paste(dfMeta_pbmc$patient_id,dfMeta_pbmc$time_point,dfMeta_pbmc$covid_status))))
+myProps <- as.data.frame(myFreqs/rowSums(myFreqs))
+myProps$patient_id <- gsub("(.*) (.*) (.* .*)","\\1",rownames(myProps))
+myProps$time_point <- factor(gsub("(.*) (.*) (.* .*)","\\2",rownames(myProps)),levels=levels(dfMeta_pbmc$time_point_factor))
+myProps$covid_status <- gsub("(.*) (.*) (.* .*$)","\\3",rownames(myProps))
+myLongProps <- as.data.frame(pivot_longer(myProps,cols=-colnames(myProps)[!colnames(myProps)%in%unique(dfMeta_pbmc$cell_state_woIFN[dfMeta_pbmc$cell_compartment%in%c("DC","Monocyte")])],names_to = "cell_state",values_to = "fraction"))
+
+
+meanLongProps <- myLongProps[!duplicated(paste(myLongProps$cell_state,myLongProps$covid_status,myLongProps$time_point)),]
+for (i in 1:nrow(meanLongProps)) { 
+  meanLongProps$fraction[i] <- mean(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+  meanLongProps$sd[i] <- sd(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+}
+
+myCols <- dfMeta_pbmc$cell_state_color[!duplicated(dfMeta_pbmc$cell_state)]
+names(myCols) <- dfMeta_pbmc$cell_state[!duplicated(dfMeta_pbmc$cell_state)]
+myCols <- myCols[grepl("(Mono|DC)",names(myCols))]
+
+myPlot <- ggplot(myLongProps[grepl("nflammatory",myLongProps$cell_state),], aes(x=factor(gsub("D","",time_point), levels=gsub("D","",levels(dfMeta_pbmc$time_point_factor))), y=fraction,col=covid_status)) + geom_boxplot(outlier.shape = NA) + geom_point(position = position_dodge(width=.75),size=1) + scale_color_manual(values=rev(c("green","orange","red"))) + xlab("Days since inoculation") + ylab("Fraction of inflammatory monos") + theme_classic(base_family = "Helvetica") + theme(aspect.ratio=1)# + facet_wrap(~covid_status,ncol=2,scales="free_x")
+myPlot
+
+```
+
+
+```{r label="make figure of activated T cell markers and dynamics",fig.width=10,fig.height=10}
+df_nasal$cell_state_woIfn <- gsub(" IFN stim","",df_nasal$cell_state)
+Idents(df_nasal) <- factor(df_nasal$cell_state_woIfn,levels=unique(df_nasal$cell_state_woIfn[order(df_nasal$cell_state_woIfn)]))
+df_t_nasal <- subset(df_nasal,cells=colnames(df_nasal)[grepl("^T [RC]",df_nasal$cell_state) & !grepl("SARS",df_nasal$cell_state)])
+df_pbmc_Tonly <- subset(df_pbmc,cells=colnames(df_pbmc)[grepl("^T (CD|Acti|Reg)",df_pbmc$cell_state)])
+Idents(df_pbmc_Tonly) <- df_pbmc_Tonly$cell_state_woIFN
+
+
+myFeatures <- c("CD3D","CD8A","CD4","FOXP3","TIGIT","IL10","MKI67","CD38","CD28","CD27","SELL","GZMK","CTLA4","GIMAP4","ICOS","GBP2","CXCR3","ITGAE")
+aimAssayMarkers <- c("CD40LG","CD69","LAMP1","TNFRSF9","TNFRSF4","IL2RA","CD274")
+
+# OX40 and CD25 CD40L  CD69  CD107a and CD137 (4-1BB) PD-L1 #protein names
+c("TNFRSF4","IL2RA","CD40LG","CD69","LAMP1","TNFRSF9","CD274") #gene names
+
+myAbFeatures <- c("AB-CD38","AB-ICOS","AB-CD27","AB-SELL","AB-CD28")
+DotPlot(df_t_nasal,features=myFeatures,scale.max = 100,dot.scale = 3) + theme(aspect.ratio = length(unique(Idents(df_t_nasal)))/length(myFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+DotPlot(df_pbmc_Tonly,features=myFeatures,scale.max = 100,dot.scale = 3) + theme(aspect.ratio = length(unique(Idents(df_pbmc_Tonly)))/length(myFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+DotPlot(df_pbmc_Tonly,features=myAbFeatures,scale.max = 100,dot.scale = 3,assay = "ADT",scale=F,cols = c("lightgrey", "red")) + theme(aspect.ratio = length(unique(Idents(df_pbmc_Tonly)))/length(myAbFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+# For main figure
+df_t_nasal_act <- subset(df_t_nasal,cells=colnames(df_t_nasal)[grep("Activated",df_t_nasal$cell_state)])
+df_pbmc_Tonly_act <- subset(df_pbmc_Tonly,cells=colnames(df_pbmc_Tonly)[grep("Activated",df_pbmc_Tonly$cell_state)])
+myFeatures <- c("CD3D","CD8A","CD4","FOXP3","IL10","MKI67","CD38","CD28","CD27","ICOS","SELL","GZMK","PRF1")
+
+myAbFeatures <- c("AB-CD38","AB-ICOS","AB-CD27","AB-SELL","AB-CD28")
+
+nasalPlot <- DotPlot(df_t_nasal_act,features=myFeatures,scale.max = 100,dot.scale = 3,scale=F) + theme(aspect.ratio = length(unique(Idents(df_t_nasal_act)))/length(myFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+pbmcRnaPlot <- DotPlot(df_pbmc_Tonly_act,features=myFeatures,scale.max = 100,dot.scale = 3,scale=F) + theme(aspect.ratio = length(unique(Idents(df_pbmc_Tonly_act)))/length(myFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+pbmcAdtPlot <- DotPlot(df_pbmc_Tonly_act,features=myAbFeatures,scale.max = 100,scale.min = 0,dot.scale = 3,assay = "ADT",scale=F,cols = c("lightgrey", "red")) + theme(aspect.ratio = length(unique(Idents(df_pbmc_Tonly_act)))/length(myAbFeatures),axis.text.y=element_text(size=8), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 8))
+
+myCombinedPlot <- pbmcRnaPlot + pbmcAdtPlot + nasalPlot + plot_layout(guides="collect",ncol=2)
+myCombinedPlot
+
+```
+
+```{r label="barplot of activated T cell abundances"}
+dfMeta_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+dfMeta_pbmc <- dfMeta_pbmc[grep("^T ",dfMeta_pbmc$cell_state),]
+dfMeta_pbmc$my_select_cells <- "foo"
+dfMeta_pbmc$my_select_cells[grepl("^T [CR].*Activated.*",dfMeta_pbmc$cell_state_woIFN)] <- paste(gsub("(T (CD[48]|Reg)).*","\\1",dfMeta_pbmc$cell_type[grepl("^T [CR].*Activated.*",dfMeta_pbmc$cell_state_woIFN)]),"Activated")
+
+myFreqs <- t(as.data.frame.matrix(table(dfMeta_pbmc$my_select_cells,paste(dfMeta_pbmc$patient_id,dfMeta_pbmc$time_point,dfMeta_pbmc$covid_status))))
+myProps <- as.data.frame(myFreqs/rowSums(myFreqs))
+myProps$patient_id <- gsub("(.*) (.*) (.* .*)","\\1",rownames(myProps))
+myProps$time_point <- factor(gsub("(.*) (.*) (.* .*)","\\2",rownames(myProps)),levels=levels(dfMeta_pbmc$time_point_factor))
+myProps$covid_status <- gsub("(.*) (.*) (.* .*)","\\3",rownames(myProps))
+myLongProps <- as.data.frame(pivot_longer(myProps,cols=-colnames(myProps)[!colnames(myProps)%in%unique(dfMeta_pbmc$my_select_cells)],names_to = "cell_state",values_to = "fraction"))
+myLongProps <- myLongProps[grepl(".*Activated.*",myLongProps$cell_state),]
+
+meanLongProps <- myLongProps[!duplicated(paste(myLongProps$cell_state,myLongProps$covid_status,myLongProps$time_point)),]
+for (i in 1:nrow(meanLongProps)) { 
+  meanLongProps$fraction[i] <- mean(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+  meanLongProps$sd[i] <- sd(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+}
+myLongProps$covid_status <- factor(myLongProps$covid_status,levels=c("Sustained infection","Transient infection","Abortive infection"))
+ggplot(myLongProps,aes(x=factor(gsub("D","",time_point),levels=gsub("D","",levels(dfMeta_pbmc$time_point_factor))),y=fraction,col=covid_status)) + geom_boxplot(outlier.shape = NA) + geom_point(position = position_dodge(width=.75),size=1) + scale_color_manual(values = c("red","orange","green")) +
+  facet_wrap(~cell_state,ncol=3,scales="free_x") + theme_classic() + xlab("Days since inoculation") + ylab("Fraction of activated / all T cells")
+
+#Nasal
+dfMeta_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+dfMeta_nasal <- dfMeta_nasal[grep("^T ",dfMeta_nasal$cell_state),]
+dfMeta_nasal$my_select_cells <- "foo"
+dfMeta_nasal$my_select_cells[grepl("^T [CR].*Activated.*",dfMeta_nasal$cell_state)] <- paste(gsub("(T (CD[48]|Reg)).*","\\1",dfMeta_nasal$cell_type[grepl("^T [CR].*Activated.*",dfMeta_nasal$cell_state)]),"Activated")
+
+myNasalFreqs <- t(as.data.frame.matrix(table(dfMeta_nasal$my_select_cells,paste(dfMeta_nasal$patient_id,dfMeta_nasal$time_point,dfMeta_nasal$covid_status))))
+myNasalProps <- as.data.frame(myNasalFreqs/rowSums(myNasalFreqs))
+myNasalProps$patient_id <- gsub("(.*) (.*) (.* .*)","\\1",rownames(myNasalProps))
+myNasalProps$time_point <- factor(gsub("(.*) (.*) (.* .*)","\\2",rownames(myNasalProps)),levels=levels(dfMeta_nasal$time_point_factor))
+myNasalProps$covid_status <- gsub("(.*) (.*) (.* .*)","\\3",rownames(myNasalProps))
+myNasalLongProps <- as.data.frame(pivot_longer(myNasalProps,cols=-colnames(myNasalProps)[!colnames(myNasalProps)%in%unique(dfMeta_nasal$my_select_cells)],names_to = "cell_state",values_to = "fraction"))
+myNasalLongProps <- myNasalLongProps[grepl(".*Activated.*",myNasalLongProps$cell_state),]
+
+myNasalLongProps$covid_status <- factor(myNasalLongProps$covid_status,levels=c("Sustained infection","Transient infection","Abortive infection"))
+ggplot(myNasalLongProps,aes(x=factor(gsub("D","",time_point),levels=gsub("D","",levels(dfMeta_nasal$time_point_factor))),y=fraction,col=covid_status)) + geom_boxplot(outlier.shape = NA) + geom_point(position = position_dodge(width=.75),size=1) + scale_color_manual(values = c("red","orange","green")) +
+  facet_wrap(~cell_state,ncol=3,scales="free_x") + theme_classic() + xlab("Days since inoculation") + ylab("Fraction of activated / all T cells")
+
+```
+
+```{r label="investigate TCR repertoire overlap between activated nasal and pbmc T cells"}
+pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myTcrs <- myTcrs[paste0(myTcrs$X,"-1")%in%rownames(pbmc),]
+colnames(myTcrs) <- paste0(colnames(myTcrs),"_tcr")
+
+pbmc[paste0(myTcrs$X,"-1"),colnames(myTcrs)[!colnames(myTcrs)%in%c(colnames(pbmc),"X_tcr")]] <- myTcrs[,!colnames(myTcrs)%in%c(colnames(pbmc),"X_tcr")]
+pbmc <- pbmc[!is.na(pbmc$has_ir_tcr),]
+
+pbmc <- pbmc[!is.na(pbmc$IR_VDJ_1_cdr3_tcr) & pbmc$IR_VDJ_1_cdr3_tcr!="" & !is.na(pbmc$patient_id),]
+
+pbmc$tcr_clonotype <- pbmc$IR_VDJ_1_cdr3_tcr
+pbmc$tcr_clonotype_patient <- paste(pbmc$tcr_clonotype,pbmc$patient_id)
+
+pbmc <- pbmc[grepl("^T [CR]",pbmc$cell_compartment) & grepl("^T [CR]",pbmc$cell_state),]
+pbmc$cell_state_woIFN_factor <- droplevels(pbmc$cell_state_woIFN_factor)
+
+nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil4.rds")
+
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_nasal_221003_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myTcrs <- myTcrs[myTcrs$X%in%rownames(nasal),]
+colnames(myTcrs) <- paste0(colnames(myTcrs),"_tcr")
+
+nasal[myTcrs$X,colnames(myTcrs)[!colnames(myTcrs)%in%c(colnames(nasal),"X_tcr")]] <- myTcrs[,!colnames(myTcrs)%in%c(colnames(nasal),"X_tcr")]
+nasal <- nasal[!is.na(nasal$has_ir_tcr),]
+
+nasal <- nasal[!is.na(nasal$IR_VDJ_1_cdr3_tcr) & nasal$IR_VDJ_1_cdr3_tcr!="" & !is.na(nasal$patient_id),]
+
+nasal$tcr_clonotype <- nasal$IR_VDJ_1_cdr3_tcr
+nasal$tcr_clonotype_patient <- paste(nasal$tcr_clonotype,nasal$patient_id)
+
+nasal <- nasal[nasal$cell_compartment=="Tissue resident lymphoid" & grepl("^T [CR]",nasal$cell_type),]
+nasal$cell_state_woIfn_factor <- factor(gsub(" IFN stim","",nasal$cell_state))
+
+overlapMatrix <- (as.data.frame.matrix(sapply(levels(pbmc$cell_state_woIFN_factor),function(x) table(nasal$cell_state_woIfn_factor[nasal$tcr_clonotype_patient%in%pbmc$tcr_clonotype_patient[pbmc$cell_state_woIFN_factor==x]]))))
+
+#overlapProps <- overlapMatrix/rowSums(overlapMatrix)
+overlapMatrix <- overlapMatrix[rowSums(overlapMatrix)>3,colSums(overlapMatrix)>3]
+overlapProps <- (overlapMatrix-apply(overlapMatrix,1,min))/apply(overlapMatrix,1,max)
+overlapProps <- overlapProps[!is.na(rowSums(overlapProps)),]
+overlapProps <- overlapProps[,colSums(overlapProps)!=0]
+Heatmap(overlapProps,cluster_rows = F,cluster_columns = F,col = colorRamp2(breaks = c(0,.5,1),colors = c("white","lightgrey","black")),name="min/max normalised overlap",width = unit(ncol(overlapProps)*12,"pt"),height = unit(nrow(overlapProps)*12,"pt"))
+```
+
+Below we use generalised linear mixed modeling to fit relative cell type abundances across time and infection group
+```{r label="GLMM on all PBMCs woIFN fdr corrected",fig.height=15,fig.width=9, results = 'hide'}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_compartment
+# With all cell states + VDJ it doesn't fit on a page, so do analysis separate for T and B wVDJ, and for all woIFN
+dfMeta$annotation <- gsub(" IFN stim","",dfMeta$cell_state_wVDJ)
+dfMeta$annotation <- factor(dfMeta$annotation,levels=unique(gsub(" IFN stim","",levels(dfMeta$cell_state_wVDJ_factor))))
+
+dfMeta$annotation <- dfMeta$cell_state_woIFN_factor
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+
+dfMeta$sample_id <- paste(dfMeta$sample_id,dfMeta$orig.ident,sep=";") # This will create 2 technical replicates from sequencing libraries per sample
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+postmean_infected_pbmc <- postmean_infected
+postmean_uninfected_pbmc <- postmean_uninfected
+postmean_resisted_pbmc <- postmean_resisted
+lfsr_infected_pbmc <- lfsr_infected
+lfsr_uninfected_pbmc <- lfsr_uninfected
+lfsr_resisted_pbmc <- lfsr_resisted
+
+# Might be more consistent to just subset out of a large figure
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+# For Activated T cells
+pbmcForActT_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001, maxL2FC = 10)
+
+# For myeloids
+pbmcForMyeloid_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001, maxL2FC = 6)
+
+pbmcForActT_dotplot
+```
+
+```{r label="GLMM on B cells w VDJ woIFN fdr corrected",fig.height=15,fig.width=9, results = 'hide'}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_compartment
+# With all cell states + VDJ it doesn't fit on a page, so do analysis separate for T and B wVDJ, and for all woIFN
+dfMeta$annotation <- gsub(" IFN stim","",dfMeta$cell_state_wVDJ)
+dfMeta$annotation <- factor(dfMeta$annotation,levels=unique(gsub(" IFN stim","",levels(dfMeta$cell_state_wVDJ_factor))))
+
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+dfMeta <- dfMeta[dfMeta$cell_compartment%in%c("B","B ABS"),]
+dfMeta$annotation <- droplevels(dfMeta$annotation)
+meanCells <- meanCells[names(meanCells)%in%dfMeta$annotation]
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+
+dfMeta$sample_id <- paste(dfMeta$sample_id,dfMeta$orig.ident,sep=";") # This will create 2 technical replicates from sequencing libraries per sample
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               +(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               +(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+postmean_infected_pbmc <- postmean_infected
+postmean_uninfected_pbmc <- postmean_uninfected
+postmean_resisted_pbmc <- postmean_resisted
+lfsr_infected_pbmc <- lfsr_infected
+lfsr_uninfected_pbmc <- lfsr_uninfected
+lfsr_resisted_pbmc <- lfsr_resisted
+
+# Might be more consistent to just subset out of a large figure
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+selectCelltypes <- rownames(myLtsr)[apply(myLtsr,1,min)<.1]
+
+pbmcBonly_dotplot <- Dotplot_rik(myPostmean = myPostmean[selectCelltypes,], myLtsr = myLtsr[selectCelltypes,], meanCells = meanCells[selectCelltypes], fdrMax = 0.001,maxL2FC = 6)
+
+pbmcBonly_dotplot
+```
+
+```{r label="GLMM on nasal immune cells w VDJ fdr corrected",fig.height=7,fig.width=8}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+#dfMeta$cell_state_woIFN <- gsub(" IFN stim","",dfMeta$cell_state)
+#dfMeta$cell_state_woIFN <- gsub(" Ig[A-Z]","",dfMeta$cell_state_woIFN)
+
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_compartment
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation <- dfMeta$cell_state_woIFN
+dfMeta$annotation_factor <- dfMeta$cell_state_woIFN_factor
+
+dfMeta$annotation[dfMeta$cell_compartment%in%c("Ciliated","Secretory")] <- "epithelial"
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+lfsr_infected <- lfsr_infected[rownames(lfsr_infected)!="epithelial",]
+postmean_resisted <- postmean_resisted[rownames(postmean_resisted)!="epithelial",]
+lfsr_resisted <- lfsr_resisted[rownames(lfsr_resisted)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+lfsr_uninfected <- lfsr_uninfected[rownames(lfsr_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+combinedClustering
+
+postmean_infected_temp <- as.data.frame(postmean_infected)
+postmean_infected_temp$rowNumbers <- 1:nrow(postmean_infected_temp)
+combinedClustering$order <- postmean_infected_temp[unique(dfMeta$annotation[order(!grepl("^T ",dfMeta$annotation),!grepl("(Infil|Resi)",dfMeta$annotation),!grepl("^NK",dfMeta$annotation),!grepl("^B",dfMeta$annotation),!grepl("^(Mac|Mon)",dfMeta$annotation),!grepl("DC",dfMeta$annotation),dfMeta$annotation)]),"rowNumbers"]
+
+#Make figure of only activated T cells
+postmean_infected_nasal <- postmean_infected
+postmean_uninfected_nasal <- postmean_uninfected
+postmean_resisted_nasal <- postmean_resisted
+lfsr_infected_nasal <- lfsr_infected
+lfsr_uninfected_nasal <- lfsr_uninfected
+lfsr_resisted_nasal <- lfsr_resisted
+
+# FDR corrected 
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+# For B cell compartment
+immuneInfilForB_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 6)
+
+
+# For activated T cells
+immuneInfilForActT_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 10)
+
+immuneInfilForActT_dotplot
+```
+
+
+```{r label="GLMM on nasal myeloid cells cells w VDJ fdr corrected",fig.height=7,fig.width=8}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_compartment
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation <- dfMeta$cell_state_woIFN
+dfMeta$annotation_factor <- dfMeta$cell_state_woIFN_factor
+
+dfMeta$annotation[dfMeta$cell_compartment%in%c("Ciliated","Secretory")] <- "epithelial"
+dfMeta$annotation[grepl("Macrophage",dfMeta$annotation)] <- "Macrophage"
+dfMeta$annotation[dfMeta$cell_compartment=="Tissue resident lymphoid"] <- "Lymphoid"
+
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+lfsr_infected <- lfsr_infected[rownames(lfsr_infected)!="epithelial",]
+postmean_resisted <- postmean_resisted[rownames(postmean_resisted)!="epithelial",]
+lfsr_resisted <- lfsr_resisted[rownames(lfsr_resisted)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+lfsr_uninfected <- lfsr_uninfected[rownames(lfsr_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+combinedClustering
+
+postmean_infected_temp <- as.data.frame(postmean_infected)
+postmean_infected_temp$rowNumbers <- 1:nrow(postmean_infected_temp)
+combinedClustering$order <- postmean_infected_temp[unique(dfMeta$annotation[order(!grepl("^T ",dfMeta$annotation),!grepl("(Infil|Resi)",dfMeta$annotation),!grepl("^NK",dfMeta$annotation),!grepl("^B",dfMeta$annotation),!grepl("^(Mac|Mon)",dfMeta$annotation),!grepl("DC",dfMeta$annotation),dfMeta$annotation)]),"rowNumbers"]
+
+#Make figure of only activated T cells
+postmean_infected_nasal <- postmean_infected
+postmean_uninfected_nasal <- postmean_uninfected
+postmean_resisted_nasal <- postmean_resisted
+lfsr_infected_nasal <- lfsr_infected
+lfsr_uninfected_nasal <- lfsr_uninfected
+lfsr_resisted_nasal <- lfsr_resisted
+
+# FDR corrected 
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+myeloidNose_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 6)
+myeloidNose_dotplot
+```
+
+
+```{r label="GLMM on global nasal immune cells for figures fdr corrected",fig.height=7,fig.width=8}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil4.rds")
+dfMeta$cell_state_woIFN <- gsub(" IFN stim","",dfMeta$cell_state)
+dfMeta$cell_state_woIFN <- gsub(" Ig[A-Z]","",dfMeta$cell_state_woIFN)
+
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_compartment
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_state_woIFN
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation[grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)] <- paste(dfMeta$annotation[grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)],"Infiltrating")
+dfMeta$annotation[grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)] <- "T Infiltrating"
+dfMeta$annotation[!grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)] <- paste(dfMeta$annotation[!grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)],"Tissue Resident")
+dfMeta$annotation[!grepl("(Infiltrating|Activated)",dfMeta$cell_state) & grepl("^T CD",dfMeta$cell_state)] <- "T Resident"
+
+#Just split CD4/CD8
+dfMeta$annotation[grepl("(CD4)",dfMeta$cell_state)] <- "T CD4"
+dfMeta$annotation[grepl("(CD8)",dfMeta$cell_state)] <- "T CD8"
+
+#dfMeta$annotation[grepl("^T ",dfMeta$annotation)] <- "T"
+dfMeta$annotation[grepl("cDC",dfMeta$annotation)] <- "cDC"
+dfMeta$annotation[grepl("AS-DC",dfMeta$annotation)] <- "pDC"
+dfMeta$annotation[grepl("(Macr|Langer)",dfMeta$annotation)] <- "Macrophage"
+
+dfMeta$annotation[dfMeta$cell_compartment%in%c("Ciliated","Secretory")] <- "epithelial"
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1")[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+lfsr_infected <- lfsr_infected[rownames(lfsr_infected)!="epithelial",]
+postmean_resisted <- postmean_resisted[rownames(postmean_resisted)!="epithelial",]
+lfsr_resisted <- lfsr_resisted[rownames(lfsr_resisted)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+lfsr_uninfected <- lfsr_uninfected[rownames(lfsr_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+combinedClustering
+
+postmean_infected_temp <- as.data.frame(postmean_infected)
+postmean_infected_temp$rowNumbers <- 1:nrow(postmean_infected_temp)
+combinedClustering$order <- postmean_infected_temp[unique(dfMeta$annotation[order(!grepl("^T ",dfMeta$annotation),!grepl("(Infil|Resi)",dfMeta$annotation),!grepl("^NK",dfMeta$annotation),!grepl("^B",dfMeta$annotation),!grepl("^(Mac|Mon)",dfMeta$annotation),!grepl("DC",dfMeta$annotation),dfMeta$annotation)]),"rowNumbers"]
+
+#Make figure of only activated T cells
+postmean_infected_nasal <- postmean_infected
+postmean_uninfected_nasal <- postmean_uninfected
+postmean_resisted_nasal <- postmean_resisted
+lfsr_infected_nasal <- lfsr_infected
+lfsr_uninfected_nasal <- lfsr_uninfected
+lfsr_resisted_nasal <- lfsr_resisted
+
+activatedRows <- grepl("[84g] Activated",rownames(postmean_infected))
+activatedRows <- rownames(postmean_infected_nasal)[grepl("(Mono|Mac|Langer|DC)",rownames(postmean_infected_nasal))]
+activatedRows <- activatedRows[order(!grepl("Mono",activatedRows),!grepl("Mac",activatedRows),!grepl("Langer",activatedRows),!grepl("(pDC|AS-DC)",activatedRows),activatedRows)]
+
+postmean_infected_coi <- postmean_infected_nasal[activatedRows,]
+postmean_uninfected_coi <- postmean_uninfected_nasal[activatedRows,]
+postmean_resisted_coi <- postmean_resisted_nasal[activatedRows,]
+lfsr_infected_coi <- lfsr_infected_nasal[activatedRows,]
+lfsr_uninfected_coi <- lfsr_uninfected_nasal[activatedRows,]
+lfsr_resisted_coi <- lfsr_resisted_nasal[activatedRows,]
+
+# FDR corrected 
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+globalImmuneInfil_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 8)
+globalImmuneInfil_dotplot
+```
+
+
+
+```{r label="GLMM on nasal epithelial cells for figures fdr corrected",fig.height=5,fig.width=9}
+gc()
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+
+dfMeta$annotation <- dfMeta$cell_compartment
+dfMeta$annotation <- dfMeta$cell_state
+dfMeta$annotation <- dfMeta$cell_type
+dfMeta$annotation <- dfMeta$cell_state_wVDJ
+dfMeta$annotation <- dfMeta$cell_state_woIFN_factor
+
+meanCells <- rowMeans(as.data.frame.matrix(table(dfMeta$annotation,dfMeta$sample_id)))
+
+dfMeta <- dfMeta[dfMeta$cell_compartment%in%c("Ciliated","Secretory"),]
+dfMeta$annotation <- droplevels(dfMeta$annotation)
+
+dfMeta$covid_status[dfMeta$patient_id%in%c("636163","677306","677696")] <- "Resisted"
+dfMeta$covid_status[dfMeta$patient_id%in%c("635779", "666427", "676586", "651806", "674700", "673353")] <- "Infected"
+dfMeta$covid_status[dfMeta$patient_id%in%c("674762", "674004", "672533", "673216", "667082", "674019",  "673067")] <- "Uninfected"
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Infected",c("sample_id","patient_id","time_point_factor","orig.ident")] 
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (square root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_infected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Uninfected",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_uninfected = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+mymetadata <- dfMeta[!duplicated(dfMeta$sample_id),]
+
+metadata <- mymetadata[mymetadata$covid_status=="Resisted",c("sample_id","patient_id","time_point_factor","covid_status","orig.ident")] 
+
+Y = table(dfMeta$sample_id[!is.na(dfMeta$annotation)],dfMeta$annotation[!is.na(dfMeta$annotation)])
+Y <- Y[rownames(Y)%in%metadata$sample_id,]
+
+nsamples = nrow(Y)
+ncells = ncol(Y)
+
+metadataExp=cbind(metadata[rep(match(rownames(Y),as.character(metadata$sample_id)),ncells),],Celltype=rep(colnames(Y),rep(nsamples,ncells)))
+res.prop=glmer(I(c(Y))~
+                 (1|Celltype)
+               #+(1|sample_id)
+               +(1|patient_id)
+               +(1|time_point_factor)
+               #+(1|covid_status)
+               #+(1|orig.ident)
+               
+               #+(1|sample_id:Celltype)
+               +(1|patient_id:Celltype)
+               +(1|time_point_factor:Celltype)
+               #+(1|orig.ident:Celltype)
+               ,
+               family=poisson,data=metadataExp,control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+# standard errors of standard deviations (squre root of the variance parameters)
+devfun = update(res.prop, devFunOnly=T)
+pars = getME(res.prop, c("theta","fixef"))
+hess = hessian(devfun, unlist(pars))
+sdse.prop = data.frame(sd=unlist(pars), se=sqrt(diag(solve(hess))))
+
+# posterior means and their standard deviations
+res.prop.ranef = ranef(res.prop)
+
+# Forest plot
+rownames(sdse.prop)[rownames(sdse.prop)=="theta.Celltype.(Intercept)"] <- "Residual"
+par(mar=c(3,6,1,1),mgp=c(1.2,0.5,0),family="Liberation Sans")
+Forest(sdse.prop[grep("(Celltype|Residual)",rownames(sdse.prop)),],xlim=c(0,2.5))
+
+postmean_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[1]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[1]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[1]] 
+)
+
+lfsr_resisted = cbind(
+  #getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",referenceRow = "epithelial")[[2]] 
+  getCondVal_modRik(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2,reference = "D-1",fdr = T)[[2]] 
+  #getCondVal(res.prop.ranef,"time_point_factor:Celltype",ncells,celltype=colnames(Y),nfactors = 2)[[2]] 
+)
+
+postmean_infected <- postmean_infected[rownames(postmean_infected)!="epithelial",]
+lfsr_infected <- lfsr_infected[rownames(lfsr_infected)!="epithelial",]
+postmean_resisted <- postmean_resisted[rownames(postmean_resisted)!="epithelial",]
+lfsr_resisted <- lfsr_resisted[rownames(lfsr_resisted)!="epithelial",]
+postmean_uninfected <- postmean_uninfected[rownames(postmean_uninfected)!="epithelial",]
+lfsr_uninfected <- lfsr_uninfected[rownames(lfsr_uninfected)!="epithelial",]
+combinedClustering <- hclust(dist(1-cor(t(cbind(postmean_infected,postmean_uninfected,postmean_resisted)))))
+combinedClustering$order
+
+#Make figure of only activated T cells
+postmean_infected_nasal <- postmean_infected
+postmean_uninfected_nasal <- postmean_uninfected
+postmean_resisted_nasal <- postmean_resisted
+lfsr_infected_nasal <- lfsr_infected
+lfsr_uninfected_nasal <- lfsr_uninfected
+lfsr_resisted_nasal <- lfsr_resisted
+
+activatedRows <- rownames(postmean_infected)[order(!grepl("Basal",rownames(postmean_infected)),!grepl("Deut",rownames(postmean_infected)),!grepl("Club",rownames(postmean_infected)),rownames(postmean_infected))]
+
+postmean_infected_coi <- postmean_infected[activatedRows,]
+postmean_uninfected_coi <- postmean_uninfected[activatedRows,]
+postmean_resisted_coi <- postmean_resisted[activatedRows,]
+lfsr_infected_coi <- lfsr_infected[activatedRows,]
+lfsr_uninfected_coi <- lfsr_uninfected[activatedRows,]
+lfsr_resisted_coi <- lfsr_resisted[activatedRows,]
+
+# FDR corrected 
+myPostmean <- as.data.frame(cbind(postmean_infected,postmean_resisted,postmean_uninfected))
+colnames(myPostmean) <- paste(colnames(myPostmean),c(rep("Sustained",ncol(postmean_infected)),rep("Transient",ncol(postmean_infected)),rep("Abortive",ncol(postmean_infected))),sep = "|")
+
+myLtsr <- as.data.frame(cbind(lfsr_infected,lfsr_resisted,lfsr_uninfected))
+colnames(myLtsr) <- paste(colnames(myLtsr),c(rep("Sustained",ncol(lfsr_infected)),rep("Transient",ncol(lfsr_infected)),rep("Abortive",ncol(lfsr_infected))),sep = "|")
+
+nasalEpithelial_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 8)
+
+nasalEpithelial10_dotplot <- Dotplot_rik(myPostmean = myPostmean, myLtsr = myLtsr, meanCells = meanCells, fdrMax = 0.001,maxL2FC = 10)
+nasalEpithelial10_dotplot
+
+```
+
+
+```{r label="plot amount of MAIT cells"}
+df_subset <- subset(df_pbmc,cells=colnames(df_pbmc)[grepl("^T MAI",df_pbmc$cell_type)])
+myFreqs <- t(as.data.frame.matrix(table(df_subset$cell_state,paste(df_subset$patient_id,df_subset$time_point,df_subset$covid_status))))
+myProps <- as.data.frame(myFreqs/rowSums(myFreqs))
+myProps$patient_id <- gsub("(.*) (.*) (.* .*)","\\1",rownames(myProps))
+myProps$time_point <- factor(gsub("(.*) (.*) (.* .*)","\\2",rownames(myProps)),levels=levels(df_subset$time_point_factor))
+myProps$covid_status <- gsub("(.*) (.*) (.* .*$)","\\3",rownames(myProps))
+myLongProps <- as.data.frame(pivot_longer(myProps,cols=-colnames(myProps)[!colnames(myProps)%in%unique(df_subset$cell_state)],names_to = "cell_state",values_to = "fraction"))
+
+
+meanLongProps <- myLongProps[!duplicated(paste(myLongProps$cell_state,myLongProps$covid_status,myLongProps$time_point)),]
+for (i in 1:nrow(meanLongProps)) { 
+  meanLongProps$fraction[i] <- mean(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+  meanLongProps$sd[i] <- sd(myLongProps$fraction[myLongProps$cell_state==meanLongProps$cell_state[i] & myLongProps$time_point==meanLongProps$time_point[i] & myLongProps$covid_status==meanLongProps$covid_status[i]]) 
+}
+
+myCols <- df_pbmc$cell_state_color[!duplicated(df_pbmc$cell_state)]
+names(myCols) <- df_pbmc$cell_state[!duplicated(df_pbmc$cell_state)]
+myCols <- myCols[grepl("MAI",names(myCols))]
+
+myLongProps$covid_status <- factor(myLongProps$covid_status,levels=c("Sustained infection","Transient infection","Abortive infection"))
+myPlot <- ggplot(myLongProps[myLongProps$cell_state%in%c("T MAI Activated"),], aes(x=factor(gsub("D","",time_point), levels=gsub("D","",levels(df_subset$time_point_factor))), y=fraction,col=covid_status)) + geom_boxplot(outlier.shape = NA) + geom_point(position = position_dodge(width=.75),size=1) + scale_color_manual(values=rev(c("green","orange","red"))) + xlab("Days since inoculation") + ylab("Fraction of all MAI T cells") + theme_classic() + theme(aspect.ratio=1)
+myPlot
+
+
+```
+
+```{r label="plot symptoms and other clinical manifestations over time"}
+
+# Symptoms
+symp <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/clinicalData/HVO-CS-003 - Covid Characterisation - DSMB4 - OC Data - 30JUL2021_Q5Q6.xlsx - Symptom Diary.tsv",sep="\t",header = T,stringsAsFactors = F)
+symp <- symp[!is.na(symp$Total.Symptom.Score..n.),]
+symp_worst <- symp[!duplicated(paste(symp$Subject,symp$Day)),]
+for (symptom in colnames(symp)[grep("\\.n\\.",colnames(symp))]) {
+  if (!(symptom %in% c("Day..n.","Timepoint..n.","Cold.Severity...compared.to.yesterday..n."))) {
+  for (patient_id in unique(symp$Subject)) {
+  for (day in unique(symp$Day[symp$Subject==patient_id])) {
+    symp_worst[symp_worst$Subject==patient_id & symp_worst$Day==day,symptom] <- round(min(symp[symp$Subject==patient_id & symp$Day==day,symptom]))
+  }
+  }
+  }
+}
+symp <- symp_worst
+colnames(symp)[grep("\\.\\.n\\.",colnames(symp))]
+symp$time_point <- paste0("D",symp$Day..n.)
+higestTotalSymtom_table <- sapply(unique(as.character(symp$Subject)),function(x) max(symp$Total.Symptom.Score..n.[as.character(symp$Subject)==x]))
+symp$highest_total_symptoms <- higestTotalSymtom_table[as.character(symp$Subject)]
+dayOfPeakTable <- sapply(unique(as.character(symp$Subject)),function(x) min(symp$Day..n.[symp$Total.Symptom.Score..n.==unique(symp$highest_total_symptoms[as.character(symp$Subject)==x]) & as.character(symp$Subject)==x]))
+symp$day_of_highest_total_symptoms <- dayOfPeakTable[as.character(symp$Subject)]
+symp$day_of_highest_total_symptoms[symp$highest_total_symptoms==0] <- NA
+
+symp$time_point_numeric <- as.numeric(gsub("D","",symp$time_point))
+longSymp <- pivot_longer(symp[,c("Subject","time_point_numeric",colnames(symp)[grep("\\.n\\.",colnames(symp))])],cols = colnames(symp)[grep("\\.n\\.",colnames(symp))],names_to = "symptom",values_to="symptom_score")
+
+
+#Perhaps best to quantify this as % participants affected
+symp <- symp[symp$Subject%in%dfMeta_nasal$patient_id[dfMeta_nasal$covid_status=="Sustained infection"],]
+normSymp <- data.frame(time_point=unique(symp$time_point_numeric))
+for (symptom in c("Sneezing..n.","Sore.Throat..n.","Stuffy.Nose..n.","Total.Symptom.Score..n.")) {
+  normSymp[,symptom] <- sapply(unique(symp$time_point_numeric),function(x) sum(symp[symp$time_point_numeric==x,symptom]>0,na.rm = T)/6)
+}
+normSymp <- normSymp[normSymp$time_point%in% -1:14,]
+
+#Smell
+smell <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/clinicalData/HVO-CS-003 - Covid Characterisation - DSMB4 - OC Data - 30JUL2021_Q5Q6.xlsx - UPSIT Smell Test.tsv",sep="\t",header = T,stringsAsFactors = F)
+# 51 bloody ways to say that smell and taste are normal...!
+smell$Sense.of.smell..as.reported.by.subject[smell$Sense.of.smell..as.reported.by.subject=="" & smell$Comment!=""] <- "Normal"
+smell$Sense.of.smell..as.reported.by.subject[smell$Sense.of.smell..as.reported.by.subject==""] <- NA
+smell$time_point <- gsub("Admission","D-1",gsub("FU ","",gsub("ay ","",smell$Event)))
+#smell <- smell[smell$time_point%in%dfMeta_pbmc$time_point,]
+rownames(smell) <- paste(smell$Subject,smell$time_point)
+smell$smell_score <- smell$Total.Score
+smell$reported_smell_numeric <- as.numeric(factor(smell$Sense.of.smell..as.reported.by.subject,levels=c("Normal","Partial Loss","Complete Loss")))
+
+smell$time_point_numeric <- as.numeric(gsub("D","",smell$time_point))
+smell$patient_time <- paste(smell$Subject,smell$time_point_numeric,sep = "_")
+smell <- smell[!is.na(smell$time_point_numeric) & !is.na(smell$smell_score),]
+
+# Only infected
+# Min max normalise top 3 symtoms and smell and total score, plot over time, fever as well
+# Add IFN stim in blood, IFN stim in nose, Total immune infiltration in nose, B cell response, T cell response
+smell <- smell[smell$Subject%in%dfMeta_nasal$patient_id[dfMeta_nasal$covid_status=="Sustained infection"],]
+smell$normalised_smell_score <- NA
+for (patient_id in unique(smell$Subject)) {
+  mySmellScores <- smell$smell_score[smell$Subject==patient_id]
+  smell$normalised_smell_score[smell$Subject==patient_id] <- (mySmellScores-min(mySmellScores))/(max(mySmellScores)-min(mySmellScores))
+}
+meanSmell <- data.frame(time_point=unique(smell$time_point_numeric),
+                        mean_norm_smell = sapply(unique(smell$time_point_numeric),function(x) mean(smell$normalised_smell_score[smell$time_point_numeric==x])),
+                        mean_smell = sapply(unique(smell$time_point_numeric),function(x) mean(smell$smell_score[smell$time_point_numeric==x])),
+                        median_smell = sapply(unique(smell$time_point_numeric),function(x) median(smell$smell_score[smell$time_point_numeric==x])),
+                        sd_norm_smell = sapply(unique(smell$time_point_numeric),function(x) sd(smell$normalised_smell_score[smell$time_point_numeric==x])))
+
+imputedSmell <- data.frame(time_point = -1:14, imputed_smell = NA)
+for (time_point in imputedSmell$time_point) { 
+  if (time_point%in%meanSmell$time_point) { 
+    imputedSmell$imputed_smell[imputedSmell$time_point==time_point] <- meanSmell$median_smell[meanSmell$time_point==time_point]
+  }
+}
+imputedSmell$median_smell <- imputedSmell$imputed_smell
+for (time_point in imputedSmell$time_point) {
+  if (is.na(imputedSmell$median_smell[imputedSmell$time_point==time_point])) {
+    for (daysBack in 1:14) { if (!is.na(imputedSmell$median_smell[imputedSmell$time_point==(time_point-daysBack)])) { break } }
+    for (daysForward in 1:14) { if (!is.na(imputedSmell$median_smell[imputedSmell$time_point==(time_point+daysForward)])) { break } }
+    daysDifference <- daysForward+daysBack
+    tempDifference <- imputedSmell$median_smell[imputedSmell$time_point==(time_point+daysForward)]-imputedSmell$median_smell[imputedSmell$time_point==(time_point-daysBack)]
+    tempDifferencePerDay <- tempDifference/daysDifference
+    imputedSmell$imputed_smell[imputedSmell$time_point==time_point] <- imputedSmell$median_smell[imputedSmell$time_point==(time_point-daysBack)]+(tempDifferencePerDay*daysBack)
+  }
+}
+medianSmell <- meanSmell$median_smell
+names(medianSmell) <- meanSmell$time_point
+imputedMedianSmell <- imputedSmell$imputed_smell
+names(imputedMedianSmell) <- imputedSmell$time_point
+
+
+#Also fever
+vital <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/clinicalData/HVO-CS-003 - Covid Characterisation - DSMB4 - OC Data - 30JUL2021_Q5Q6.xlsx - Vital Signs.tsv",sep="\t",header = T,stringsAsFactors = F)
+vital$time_point <- gsub("Admission","D-1",gsub("FU ","",gsub("ay ","",vital$Event))) # Again, sometimes day-1 can be day-2 here
+vital$time_point <- gsub("Challenge Day","D0",vital$time_point)
+vital$Interpretation_vitals <- vital$Interpretation
+vital$sample <- paste(vital$Subject,vital$time_point)
+covidStatusTable <- dfMeta_nasal$covid_status[!duplicated(dfMeta_nasal$patient_id)]
+names(covidStatusTable) <- dfMeta_nasal$patient_id[!duplicated(dfMeta_nasal$patient_id)]
+vital$covid_status <- covidStatusTable[as.character(vital$Subject)]
+vital_noDup <- vital[!duplicated(vital$sample),]
+for (i in unique(vital$sample)) {
+  for (myCol in colnames(vital)[c(11:15,17)]) {
+    vital_noDup[vital_noDup$sample==i,myCol] <- mean(vital[vital$sample==i,myCol],na.rm=T)
+  }
+  vital_noDup$Interpretation_vitals[vital_noDup$sample==i] <- names(table(vital$Interpretation_vitals[vital$sample==i])[order(table(vital$Interpretation_vitals[vital$sample==i]),decreasing = T)][1])
+}
+rownames(vital_noDup) <- vital_noDup$sample
+vital_noDup$time_point_numeric <- as.numeric(gsub("D","",vital_noDup$time_point))
+vital$time_point_numeric <- as.numeric(gsub("D","",vital$time_point))
+
+vital_noDup <- vital_noDup[!is.na(vital_noDup$time_point_numeric) & vital_noDup$time_point_numeric<=14,]
+vital <- vital[!is.na(vital$time_point_numeric) & vital$time_point_numeric<=14,]
+
+vital_noDup$norm_temperature <- NA
+vital$norm_temperature <- NA
+for (patient_id in unique(vital_noDup$Subject)) {
+  myTemps <- vital_noDup$Temperature[vital_noDup$Subject==patient_id]
+  vital_noDup$norm_temperature[vital_noDup$Subject==patient_id] <- (myTemps-min(myTemps))/(max(myTemps)-min(myTemps))
+  vital_noDup$norm_temperature[vital_noDup$Subject==patient_id] <- (myTemps-mean(myTemps))/(sd(myTemps))
+  myTemps <- vital$Temperature[vital$Subject==patient_id]
+  vital$norm_temperature[vital$Subject==patient_id] <- (myTemps-min(myTemps))/(max(myTemps)-min(myTemps))
+  vital$norm_temperature[vital$Subject==patient_id] <- (myTemps-mean(myTemps))/(sd(myTemps))
+}
+
+vital_onlyInf <- vital[vital$covid_status=="Sustained infection",]
+vital_onlyInf_imputed <- vital_onlyInf
+medianTemperatures_infected <- sapply(unique(vital_onlyInf$time_point_numeric), function(time_point_numeric) median(vital_onlyInf$Temperature[vital_onlyInf$time_point_numeric==time_point_numeric]))
+names(medianTemperatures_infected) <- unique(vital_onlyInf$time_point_numeric)
+
+
+# Chemistry to look at CPR
+chem <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/clinicalData/HVO-CS-003 - Covid Characterisation - DSMB4 - TDL Data - 30JUL2021_Q5Q6.xlsx - TDL Data.tsv",sep="\t",header = T,stringsAsFactors = F)
+chem$VISIT[chem$Subject=="673067" & grepl("2021-07-19",chem$lbdtc)] <- "DAY 10" # This one had a typo Day 1 -> Day 10
+head(chem[chem$LBTEST=="Phosphate",])
+head(chem[chem$LBTEST=="Monocytes",])
+chem$time_point <- gsub("D-2","D-1",gsub("AY ","",chem$VISIT)) # Remember that preinfection samples actually differ 1 day from our sampling day!
+chem <- chem[chem$time_point%in%dfMeta_nasal$time_point,]
+chem <- chem[chem$LBTEST%in%names(table(chem$LBTEST)[table(chem$LBTEST)>82]),]
+chem$measurement <- as.numeric(gsub("<","",chem$LBORRES))
+chem$sample <- paste(chem$Subject,chem$time_point)
+schem <- chem[,c("sample","LBTEST","measurement")]
+lschem <- as.data.frame(pivot_wider(schem,names_from = "LBTEST",values_from = "measurement"))
+
+lschem$CRP <- lschem$`CRP-High Sensitivity`
+
+lschem$patient_id <- gsub("([0-9]*) D(.*)","\\1",lschem$sample)
+lschem$time_point <- as.numeric(gsub("([0-9]*) D(.*)","\\2",lschem$sample))
+lschem$covid_status <- covidStatusTable[as.character(lschem$patient_id)]
+
+myChem <- lschem[lschem$covid_status=="Sustained infection",c("CRP","patient_id","time_point","covid_status")]
+meanChem <- data.frame(time_point=unique(myChem$time_point),
+                       median_CRP = sapply(unique(myChem$time_point),function(time_point) median(myChem$CRP[myChem$time_point==time_point])),
+                       mean_CRP = sapply(unique(myChem$time_point),function(time_point) mean(myChem$CRP[myChem$time_point==time_point])))
+
+
+imputedChem <- data.frame(time_point = -1:14, imputed_CRP = NA)
+for (time_point in imputedChem$time_point) { 
+  if (time_point%in%meanChem$time_point) { 
+    imputedChem$imputed_CRP[imputedChem$time_point==time_point] <- meanChem$median_CRP[meanChem$time_point==time_point]
+  }
+}
+imputedChem$median_CRP <- imputedChem$imputed_CRP
+for (time_point in imputedChem$time_point) {
+  if (is.na(imputedChem$median_CRP[imputedChem$time_point==time_point])) {
+    for (daysBack in 1:14) { if (!is.na(imputedChem$median_CRP[imputedChem$time_point==(time_point-daysBack)])) { break } }
+    for (daysForward in 1:14) { if (!is.na(imputedChem$median_CRP[imputedChem$time_point==(time_point+daysForward)])) { break } }
+    daysDifference <- daysForward+daysBack
+    tempDifference <- imputedChem$median_CRP[imputedChem$time_point==(time_point+daysForward)]-imputedChem$median_CRP[imputedChem$time_point==(time_point-daysBack)]
+    tempDifferencePerDay <- tempDifference/daysDifference
+    imputedChem$imputed_CRP[imputedChem$time_point==time_point] <- imputedChem$median_CRP[imputedChem$time_point==(time_point-daysBack)]+(tempDifferencePerDay*daysBack)
+  }
+}
+
+
+#Combine all figures
+
+Heatmap(t(medianTemperatures_infected),cluster_rows = F,cluster_columns = F, name="Temperature", col = colorRamp2(breaks=c(36.5,36.9,37.3), colors = c("cyan","orange","red")), row_labels="Temperature",heatmap_legend_param = list(direction = "horizontal")) %v%
+Heatmap(t(imputedChem$imputed_CRP), cluster_rows = F, cluster_columns = F, name="CRP", column_labels=imputedChem$time_point, col = colorRamp2(breaks=c(0,2), colors = c("lightyellow","red")), row_labels="CRP",heatmap_legend_param = list(direction = "horizontal")) %v%
+Heatmap(t(imputedMedianSmell),cluster_rows = F,cluster_columns = F, name="UPSIT smell score", col = colorRamp2(breaks=c(0,20,40), colors = c("lightyellow","green","darkgreen")), row_labels="Smell",heatmap_legend_param = list(direction = "horizontal")) %v%
+Heatmap(t(normSymp[,c("Sore.Throat..n.","Sneezing..n.","Stuffy.Nose..n.","Total.Symptom.Score..n.")]*100), cluster_rows = F,cluster_columns = F,column_labels = normSymp$time_point, col = colorRamp2(breaks=c(0,100), colors = c("white","black")), name="% participants with symptom",heatmap_legend_param = list(direction = "horizontal"))
+
+```
+
+
+After alignment, gamma delta TCR data was first processed in scirpy in the same manner as done for the a/bTCRs
+```{r label="gdTCR"}
+dfMeta_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal.fil5.rds")
+dfMeta_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+dfMeta_pbmc$gex_barcode <- gsub("(.*)\\+.*(_.*)","\\1\\2",dfMeta_pbmc$barcode)
+
+gd <- read.csv("/mnt/projects/RL007_challengeStudy/data/gdTcr/gd_irdata_clean.csv")
+covidTable <- df_pbmc$covid_status[!duplicated(df_pbmc$patient_id)]
+names(covidTable) <- df_pbmc$patient_id[!duplicated(df_pbmc$patient_id)]
+gd$covid_status <- covidTable[as.character(gd$patient_id)]
+gd <- gd[grepl("^TR[GD]",gd$v_call_VDJ) & grepl("^TR[GD]",gd$v_call_VJ),]
+
+gd$time_point[gd$time_point%in%c("D5","D7","D10")] <- "D5-10"
+
+gd$inNasalData <- ifelse(gd$cell_gex_id%in%paste0(dfMeta_nasal$barcode,"-1"),T,F)
+gd$inPbmcData <- ifelse(gd$cell_gex_id%in%dfMeta_pbmc$gex_barcode,T,F)
+
+pbmcCellStateTable <- dfMeta_pbmc$cell_state[dfMeta_pbmc$gex_barcode%in%gd$cell_gex_id]
+names(pbmcCellStateTable) <- dfMeta_pbmc$gex_barcode[dfMeta_pbmc$gex_barcode%in%gd$cell_gex_id]
+nasalCellStateTable <- dfMeta_nasal$cell_state[paste0(dfMeta_nasal$barcode,"-1")%in%gd$cell_gex_id]
+names(nasalCellStateTable) <- paste0(dfMeta_nasal$barcode[paste0(dfMeta_nasal$barcode,"-1")%in%gd$cell_gex_id],"-1")
+
+gd$cell_state_pbmc <- pbmcCellStateTable[gd$cell_gex_id]
+gd$cell_state_nasal <- nasalCellStateTable[gd$cell_gex_id]
+gd <- gd[grepl("T (CD8|G/D)",gd$cell_state_nasal) | grepl("T (CD8|G/D)",gd$cell_state_pbmc),]
+
+gd <- gd[gd$inNasalData | gd$inPbmcData,] # the nasal data wasn't multiplexed so less important if matched GEX data is available
+
+gd$v_genes <- paste(gd$v_call_VDJ,gd$v_call_VJ,sep="_")
+gd <- gd[!gd$v_genes%in%names(table(gd$v_genes)[table(gd$v_genes)<10]),]
+
+ft <- as.data.frame.matrix(table(paste(gd$patient_id,gd$covid_status,gd$tissue,gd$time_point,sep="_"),gd$v_genes))
+fp <- as.data.frame(t(as.data.frame.matrix(apply(ft,1,function(x) (x+1)/sum(x+1)))))
+fp$patient_id <- gsub("^(.*)_(.*)_(.*)_(.*)$","\\1",rownames(fp))
+fp$covid_status <- gsub("^(.*)_(.*)_(.*)_(.*)$","\\2",rownames(fp))
+fp$tissue <- gsub("^(.*)_(.*)_(.*)_(.*)$","\\3",rownames(fp))
+fp$time_point <- gsub("^(.*)_(.*)_(.*)_(.*)$","\\4",rownames(fp))
+
+fp$group <- gsub("^.*_(.*_.*_.*)$","\\1",rownames(fp))
+fm <- fp[!duplicated(fp$group),]
+fm <- as.data.frame(t(as.data.frame.matrix(sapply(fm$group,function(x) colMeans(fp[fp$group==x,colnames(ft)]) ))))
+fm$covid_status <- gsub("^(.*)_(.*)_(.*)$","\\1",rownames(fm))
+fm$tissue <- gsub("^(.*)_(.*)_(.*)$","\\2",rownames(fm))
+fm$time_point <- gsub("^(.*)_(.*)_(.*)$","\\3",rownames(fm))
+
+fcm <- fm
+fpc <- fp
+for (covid_status in unique(fm$covid_status[fm$tissue=="PBMC"])) {
+for (time_point in unique(fm$time_point[fm$tissue=="PBMC" & fm$covid_status==covid_status])) {
+  for (v_genes in colnames(ft)) {
+    fcm[fm$tissue=="PBMC" & fm$time_point==time_point & fm$covid_status==covid_status,v_genes] <- log2(fm[fm$tissue=="PBMC" & fm$time_point==time_point & fm$covid_status==covid_status,v_genes]/fm[fm$tissue=="PBMC" & fm$time_point=="D-1" & fm$covid_status==covid_status,v_genes])
+        fpc[fp$tissue=="PBMC" & fp$time_point==time_point & fp$covid_status==covid_status,v_genes] <- log2(fp[fp$tissue=="PBMC" & fp$time_point==time_point & fp$covid_status==covid_status,v_genes]/mean(fp[fp$tissue=="PBMC" & fp$time_point=="D-1" & fp$covid_status==covid_status,v_genes]))
+  }
+}
+}
+fpl <- pivot_longer(fp,cols=colnames(ft),names_to = "v_genes",values_to = "fraction")
+fpl$time_point_num <- as.numeric(gsub("D","",fpl$time_point))
+fpcl <- pivot_longer(fpc,cols=colnames(ft),names_to = "v_genes",values_to = "l2fc")
+fpcl$time_point_num <- as.numeric(gsub("D","",fpcl$time_point))
+
+fcp <- fm
+for (covid_status in unique(fm$covid_status[fm$tissue=="PBMC"])) {
+for (time_point in unique(fm$time_point[fm$tissue=="PBMC" & fm$covid_status==covid_status])) {
+  for (v_genes in colnames(ft)) {
+    fcp[fm$tissue=="PBMC" & fm$time_point==time_point & fm$covid_status==covid_status,v_genes] <- 1
+    fcp[fm$tissue=="PBMC" & fm$time_point==time_point & fm$covid_status==covid_status,v_genes] <- wilcox.test(fp[fp$tissue=="PBMC" & fp$time_point==time_point & fp$covid_status==covid_status,v_genes],fp[fp$tissue=="PBMC" & fp$time_point=="D-1" & fp$covid_status==covid_status,v_genes])$p.value
+  }
+}
+}
+
+for (time_point in c("D5-10")) { #Day 5 doesn't have a matched time point unfortunately..
+  for (v_genes in colnames(ft)) {
+    fcp[fm$tissue=="Nasal" & fm$time_point==time_point,v_genes] <- 1
+    fcp[fm$tissue=="Nasal" & fm$time_point==time_point,v_genes] <- wilcox.test(fp[fp$tissue=="Nasal" & fp$time_point==time_point,v_genes],fp[fp$tissue=="PBMC" & fp$time_point==time_point & fp$covid_status=="Sustained infection",v_genes])$p.value
+  }
+}
+
+for (time_point in c("D5-10")) { #Day 5 doesn't have a matched time point unfortunately..
+  fcm[fm$tissue=="Nasal" & fm$time_point==time_point,colnames(ft)] <- log2(fm[fm$tissue=="Nasal" & fm$time_point==time_point,colnames(ft)]/fm[fm$tissue=="PBMC" & fm$time_point==time_point & fm$covid_status=="Sustained infection",colnames(ft)])
+}
+
+fcml <- pivot_longer(fcm,cols=colnames(ft),names_to = "v_genes", values_to = "mean_fc")
+fcml$time_point_num <- as.numeric(gsub("D","",fcml$time_point))
+fcpl <- pivot_longer(fcp,cols=colnames(ft),names_to = "v_genes", values_to = "p_value")
+fcpl$time_point_num <- as.numeric(gsub("D","",fcpl$time_point))
+if (any(fcpl[,1:4]!=fcml[,1:4])) { halt } #Matrices don't match
+fcml$p_value <- fcpl$p_value
+fcml$p_value[is.na(fcml$p_value)] <- 1
+fcml$fdr <- 1
+fcml$fdr[fcml$tissue=="PBMC" & fcml$time_point!="D-1"] <- p.adjust(fcml$p_value[fcml$tissue=="PBMC" & fcml$time_point!="D-1"])
+fcml$fdr[fcml$tissue=="Nasal" & fcml$time_point!="D5"] <- p.adjust(fcml$p_value[fcml$tissue=="Nasal" & fcml$time_point!="D5"])
+
+nasalGdStats <- as.data.frame(fcml[fcml$tissue=="Nasal",][order(fcml$mean_fc[fcml$tissue=="Nasal"]),])
+
+fml <- pivot_longer(fm,cols=colnames(ft),names_to = "v_genes",values_to = "fraction")
+fml$v_genes_factor <- factor(fml$v_genes,levels=nasalGdStats$v_genes)
+
+myCols <- distinctColorPalette(k = length(levels(fml$v_genes_factor)))
+myCols <- c("#DA8DD9", "#8C9A80", "#D8B5D6", "#7A48D0", "#8C8EC9", "#DBDCDF",  "#74B9DD", "#7DDEDA", "#DA4A8F", "#DFC260", "#DD58E0", "#D28096",  "#7D71D7", "#D56850", "#71E35C", "#D9E9C0", "#E1B295", "#BBE48E",  "#74E9B2", "#9830EC", "#CEE648")
+names(myCols) <- levels(fml$v_genes_factor)
+#myBarplot <- 
+ggplot(fml[fml$covid_status=="Sustained infection" & fml$time_point=="D5-10",], aes(x=tissue,y=fraction,fill=v_genes_factor,group=v_genes_factor)) + 
+    geom_col(position = "fill", width = 0.5, colour = "black") +
+    geom_area(aes(x = c("Nasal" = 1.25, "PBMC" = 1.75)[tissue]), 
+              position = "fill", colour = "black", alpha = 0.5,
+              outline.type = "both") +
+  scale_fill_manual(values = myCols) + theme_classic(base_family = "Helvetica") + theme(aspect.ratio = 2)
+
+
+sigVs <- nasalGdStats$v_genes[nasalGdStats$p_value<.05]
+infilGdTs <- nasalGdStats$v_genes[nasalGdStats$mean_fc>0]
+exfilGdTs <- nasalGdStats$v_genes[nasalGdStats$mean_fc<0]
+
+# Fraction infiltrating
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_nasal_221003_fromScirpy.csv",header = T,stringsAsFactors = F)
+myTcrs <- myTcrs[myTcrs$IR_VJ_1_v_gene!="" & myTcrs$IR_VJ_1_v_gene!="",] # Same filtering stringency as for g/d
+
+gd <- read.csv("/mnt/projects/RL007_challengeStudy/data/gdTcr/gd_irdata_clean.csv")
+covidTable <- df_pbmc$covid_status[!duplicated(df_pbmc$patient_id)]
+names(covidTable) <- df_pbmc$patient_id[!duplicated(df_pbmc$patient_id)]
+gd$covid_status <- covidTable[as.character(gd$patient_id)]
+gd <- gd[grepl("^TR[GD]",gd$v_call_VDJ) & grepl("^TR[GD]",gd$v_call_VJ),]
+
+gd$inNasalData <- ifelse(gd$cell_gex_id%in%paste0(dfMeta_nasal$barcode,"-1"),T,F)
+
+nasalCellStateTable <- dfMeta_nasal$cell_state[paste0(dfMeta_nasal$barcode,"-1")%in%gd$cell_gex_id]
+names(nasalCellStateTable) <- paste0(dfMeta_nasal$barcode[paste0(dfMeta_nasal$barcode,"-1")%in%gd$cell_gex_id],"-1")
+
+gd$cell_state_nasal <- nasalCellStateTable[gd$cell_gex_id]
+gd <- gd[grepl("T (CD8|G/D)",gd$cell_state_nasal),]
+gd$v_genes <- paste(gd$v_call_VDJ,gd$v_call_VJ,sep="_")
+
+dfMeta_nasal <- dfMeta_nasal[paste(dfMeta_nasal$patient_id,dfMeta_nasal$time_point)%in%paste(gd$patient_id,gd$time_point) & dfMeta_nasal$cell_compartment=="Tissue resident lymphoid",]
+
+dfMeta_nasal$tcr <- ifelse(rownames(dfMeta_nasal)%in%myTcrs$X,"abTCR","")
+dfMeta_nasal$tcr[dfMeta_nasal$tcr==""] <- ifelse(paste0(dfMeta_nasal$barcode[dfMeta_nasal$tcr==""],"-1")%in%gd$cell_gex_id[gd$v_genes=="TRDV2_TRGV9"],"typical gdTCR","")
+dfMeta_nasal$tcr[dfMeta_nasal$tcr==""] <- ifelse(paste0(dfMeta_nasal$barcode[dfMeta_nasal$tcr==""],"-1")%in%gd$cell_gex_id[gd$v_genes!="TRDV2_TRGV9"],"atypical gdTCR","")
+pie(table(dfMeta_nasal$tcr[dfMeta_nasal$tcr!="" & dfMeta_nasal$cell_state_woIFN=="T CD8 Infiltrating Memory"]))
+
+
+```
+
+```{r label="souporcell Dextramers",eval=FALSE}
+gt_list_dextramers <- list()
+for (i in c("HCS_Dex_1_smallMergedBam_soc_out", "HCS_Dex_2_individualBam_soc_out", "HCS_Dex_3_smallMergedBam_soc_out", "HCS_Dex_4_individualBam_soc_out", "HCS_Dex_5_smallMergedBam_soc_out", "HCS_Dex_6_individualBam_soc_out")) {
+  if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/",i,"/cluster_genotypes.vcf"))) {
+    cell_data <- as.data.frame(load_GT_vcf(paste0("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/",i,"/cluster_genotypes.vcf"),na.rm = F)$GT,stringsAsFactors = F)
+    colnames(cell_data) <- paste0(i,"_",colnames(cell_data))
+    gt_list_dextramers[[i]] <- cell_data
+  }
+}
+
+#write_rds(gt_list,file="/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/gt_list.rds")
+gt_list_GEXdata <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/gt_list.rds")
+for (i in names(gt_list_dextramers)) {
+  print(i)
+  print(nrow(gt_list_dextramers[[i]]))
+}
+
+allClusters <- c()
+for (sample in names(gt_list_dextramers)) {
+  for (cluster in colnames(gt_list_dextramers[[sample]])) {
+    allClusters <- c(allClusters,cluster)
+  }
+}
+
+allClusters_originalGex <- c()
+for (sample in names(gt_list_GEXdata)) {
+  for (cluster in colnames(gt_list_GEXdata[[sample]])) {
+    allClusters_originalGex <- c(allClusters_originalGex,cluster)
+  }
+}
+
+
+ref_data <- as.data.frame(load_GT_vcf("/mnt/projects/RL007_challengeStudy/souporcell/RepeatPlate.fixref.hg38.vcf",na.rm = F)$GT,stringsAsFactors = F)
+ref_data <- ref_data[,colnames(ref_data)%in%paste0("UCL_",1:16)]
+
+corTable <- as.data.frame(matrix(nrow=length(allClusters),ncol=length(colnames(ref_data))))
+colnames(corTable) <- colnames(ref_data)
+rownames(corTable) <- allClusters
+
+for (a in colnames(corTable)) {
+  sample_a_gt <- ref_data[,a]
+  names(sample_a_gt) <- rownames(ref_data)
+  sample_a_gt <- sample_a_gt[!is.na(sample_a_gt)]
+  for (b in rownames(corTable)) {
+    sample_b <- gsub("_[0-9]*$","",b)
+    sample_b_gt <- gt_list_dextramers[[sample_b]][,b]
+    names(sample_b_gt) <- rownames(gt_list_dextramers[[sample_b]])
+    sample_b_gt <- sample_b_gt[!is.na(sample_b_gt) & names(sample_b_gt)%in%names(sample_a_gt)]
+    sample_b_gt <- sample_b_gt[order(names(sample_b_gt))]
+    sample_a_gt_temp <- sample_a_gt[names(sample_a_gt)%in%names(sample_b_gt)]
+    sample_a_gt_temp <- sample_a_gt_temp[order(names(sample_a_gt_temp))]
+    if (any(names(sample_b_gt)!=names(sample_a_gt_temp))) { halt }
+    myCor <- sum(sample_a_gt_temp==sample_b_gt)/length(sample_a_gt_temp)
+    corTable[b,a] <- myCor
+    #if (is.na(myCor)) { halt }
+  }
+  print(a)
+}
+write_rds(corTable,file="/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/corTable.rds")
+
+corTable_dextramersRef <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/corTable.rds")
+
+Heatmap(corTable_dextramersRef[is.finite(rowSums(corTable_dextramersRef)),],col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+corTableFil <- corTable_dextramersRef
+corTableFil[corTableFil<.75] <- 0
+Heatmap(corTableFil,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+
+# Instead of matching to a reference, we match the souporcell genotypes from the original GEX data to the dextramer data
+corTable_soc <- as.data.frame(matrix(nrow=length(allClusters),ncol=length(allClusters_originalGex)))
+colnames(corTable_soc) <- allClusters_originalGex
+rownames(corTable_soc) <- allClusters
+
+for (a in colnames(corTable_soc)) {
+  sample_a <- gsub("_[0-9]*$","",a)
+  sample_a_gt <- gt_list_GEXdata[[sample_a]][,a]
+  names(sample_a_gt) <- rownames(gt_list_GEXdata[[sample_a]])
+  sample_a_gt <- sample_a_gt[!is.na(sample_a_gt)]
+  for (b in rownames(corTable_soc)) {
+    sample_b <- gsub("_[0-9]*$","",b)
+    sample_b_gt <- gt_list_dextramers[[sample_b]][,b]
+    names(sample_b_gt) <- rownames(gt_list_dextramers[[sample_b]])
+    sample_b_gt <- sample_b_gt[!is.na(sample_b_gt) & names(sample_b_gt)%in%names(sample_a_gt)]
+    sample_b_gt <- sample_b_gt[order(names(sample_b_gt))]
+    sample_a_gt_temp <- sample_a_gt[names(sample_a_gt)%in%names(sample_b_gt)]
+    sample_a_gt_temp <- sample_a_gt_temp[order(names(sample_a_gt_temp))]
+    if (any(names(sample_b_gt)!=names(sample_a_gt_temp))) { halt }
+    myCor <- sum(sample_a_gt_temp==sample_b_gt)/length(sample_a_gt_temp)
+    corTable_soc[b,a] <- myCor
+    #if (is.na(myCor)) { halt }
+  }
+  print(a)
+}
+write_rds(corTable_soc,file="/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/corTable_soc.rds")
+```
+
+```{r label="visualise souporcell Dextramers"}
+corTable_soc <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/corTable_soc.rds")
+
+Heatmap(corTable_soc[is.finite(rowSums(corTable_soc)),],col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+```
+
+```{r label="assign patient ids to souporcell clusters within the dextramer experiments using the comparison to our original gex data",eval=FALSE}
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+corTable_soc <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/corTable_soc.rds")
+
+patientIdTable <- dfMeta$patient_id[!duplicated(dfMeta$souporcell_cluster_matched)]
+names(patientIdTable) <- dfMeta$souporcell_cluster_matched[!duplicated(dfMeta$souporcell_cluster_matched)]
+colnames(corTable_soc) <- paste0(colnames(corTable_soc),";",patientIdTable[colnames(corTable_soc)])
+
+Heatmap(corTable_soc[is.finite(rowSums(corTable_soc)),],col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+Heatmap(ifelse(corTable_soc>.65,1,0)[is.finite(rowSums(corTable_soc)),],col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+sumCors <- data.frame(matrix(nrow=nrow(corTable_soc),ncol=length(unique(gsub(".*;(.*)","\\1",colnames(corTable_soc))))))
+rownames(sumCors) <- rownames(corTable_soc)
+colnames(sumCors) <- unique(gsub(".*;(.*)","\\1",colnames(corTable_soc)))
+for (dextramerSample in rownames(sumCors)) {
+  for (patientId in colnames(sumCors)) {
+    sumCors[dextramerSample,patientId] <- mean(as.numeric(corTable_soc[dextramerSample,gsub(".*;(.*)","\\1",colnames(corTable_soc))==patientId]))
+  }
+}
+bestCors <- sumCors[,0]
+bestCors$bestMatch <- apply(sumCors,1,function(x) names(x)[order(x,decreasing = T)][1])
+bestCors$bestMatchOverlap <- apply(sumCors,1,function(x) x[order(x,decreasing = T)][1])
+bestCors$secondBestMatch <- apply(sumCors,1,function(x) names(x)[order(x,decreasing = T)][2])
+bestCors$secondBestMatchOverlap <- apply(sumCors,1,function(x) x[order(x,decreasing = T)][2])
+bestCors$differenceBestSecondMatch_higherIsBetter <- bestCors$bestMatchOverlap-bestCors$secondBestMatchOverlap
+bestCors$goodMatch <- ifelse(bestCors$differenceBestSecondMatch_higherIsBetter>.05 & !is.na(bestCors$bestMatchOverlap),"Pass","Fail")
+#write.table(file="/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/match_socCluster_participantId.txt",x = bestCors,sep = "\t")
+```
+
+```{r label="match Dextramers to matched HLA genotypes",eval=FALSE}
+haplotypes <- as.data.frame(t(read.csv("/mnt/projects/RL007_challengeStudy/hlaGenotyping_q5q6/haplotypes_in_tableFormat_wDrb.csv",header = F,stringsAsFactors = F)))
+#haplotypes <- as.data.frame(t(read.csv("/mnt/projects/RL007_challengeStudy/hlaGenotyping_q5q6/haplotypes_in_tableFormat.csv",header = F,stringsAsFactors = F)))
+colnames(haplotypes) <- haplotypes[1,]
+haplotypes <- haplotypes[2:nrow(haplotypes),]
+
+haplong <- pivot_longer(haplotypes,cols = colnames(haplotypes)[2:7],names_to = "allele_letter",values_to = "allele")
+haplong$allele_letter_stripped <- gsub("_","",gsub("[12]$","",haplong$allele_letter))
+haplong$haplotype <- gsub("\\*","-",paste0(haplong$allele_letter_stripped,haplong$allele))
+haplong <- haplong[haplong$allele!="",]
+
+dex <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/SARS_CoV_2_Dextramer_list_reformattedForCR.csv",stringsAsFactors = F,header = T)
+dex$broad_hla <- gsub("(.*)[0-9]{2}_.*","\\1",dex$id)
+
+haplotypes$matched_dextramers <- NA
+for (patient_id in haplotypes$sample_id) {
+  haplotypes$matched_dextramers[haplotypes$sample_id==patient_id] <- paste(dex$id[dex$broad_hla%in%haplong$haplotype[haplong$sample_id==patient_id]],collapse = ";")
+}
+
+#write.csv(haplotypes,file="/mnt/projects/RL007_challengeStudy/metadata/Dextramer_patient_matches.csv",row.names = F)
+```
+
+``` {r label="load souporcell cellbarcodes and assignments for matching",eval=FALSE}
+sangerIdToSampleId <- read.csv("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/Kaylee_6666stdy_manifest_20968_211122_RL.csv",header = T)
+bestCors <- read.table(file="/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/match_socCluster_participantId.txt",sep = "\t",header = T)
+
+rm("allBarcodes")
+for (sample in c("HCS_Dex_1_smallMergedBam_soc_out", "HCS_Dex_2_individualBam_soc_out", "HCS_Dex_3_smallMergedBam_soc_out", "HCS_Dex_4_individualBam_soc_out", "HCS_Dex_5_smallMergedBam_soc_out", "HCS_Dex_6_individualBam_soc_out")) {
+  myClusters <- read.table(file = paste0("/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/",sample,"/clusters.tsv"),sep="\t",header = T)
+  myClusters <- myClusters[,!grepl("cluster",colnames(myClusters))]
+  if (grepl("smallMergedBam",sample)) { 
+    myClusters$sample_id <- gsub("(.*?)-(.*)","\\1",myClusters$barcode)
+    myClusters$barcode <- gsub("(.*?)-(.*)","\\2",myClusters$barcode)
+  } else { myClusters$sample_id <- gsub("(HCS_Dex_[1-6]).*","\\1",sample) }
+  myClusters$sanger_id <- sangerIdToSampleId$SANGER.SAMPLE.ID[sangerIdToSampleId$SUPPLIER.SAMPLE.NAME==myClusters$sample_id[1] & sangerIdToSampleId$SAMPLE.DESCRIPTION=="GEX"]
+  myClusters$matched_barcode <- paste0(myClusters$sanger_id,"_",myClusters$barcode)
+  myClusters$cor_name <- paste(sample,myClusters$assignment,sep = "_")
+  if (exists("allBarcodes")) { allBarcodes <- rbind(allBarcodes,myClusters) } else { allBarcodes <- myClusters }
+}
+
+allBarcodes[,colnames(bestCors)] <- bestCors[allBarcodes$cor_name,]
+
+#write.table(file="/mnt/projects/RL007_challengeStudy/souporcell/dextramers_individualBams/barcodes_match_socCluster_participantId.txt",x = allBarcodes,sep = "\t")
+```
+
+```{r label="clean up memory"}
+rm(df_pbmc_Tonly)
+rm(df_pbmc_Tonly_act)
+rm(df_ciliated)
+rm(df_subset)
+rm(df_t_nasal)
+rm(df_t_nasal_act)
+rm(dfmait)
+gc()
+```
+
+```{r label="make supplementary figure showing marker genes for detailed cell type annotation"}
+myScalingFactor <- 1
+
+df_nasal_epi <- subset(df_nasal,cells=colnames(df_nasal)[df_nasal$cell_compartment%in%c("Ciliated","Secretory")])
+
+# Nasal epithelial
+nasal_markers_vector <- c("Ciliated 1" = "PIFO", 
+                          "Ciliated 1" = "OMG", 
+                          "SAA1",
+                          "SAA2",
+                          "SAA4",
+                          "HLA-DRA",
+                          "HLA-DRB1",
+                          Infected = "VIRAL-SARS-CoV2",  
+                          "IFN" = "IFI44L",  
+                          "IFN" = "MX2", 
+                          "Basal 1" = "DLK2", 
+                          "Basal 1" = "KRT15", 
+                          "Basal 1" = "KRT5", 
+                          "Basal 2" = "DAPL1", 
+                          "Basal 2" = "NOTCH1",  
+                          "Cycling basal" = "MKI67", 
+                          "Cycling basal" = "NUSAP1", 
+                          Club = "SCGB3A1", 
+                          Club = "SCGB1A1", 
+                          Deuterosomal = "FOXN4", 
+                          Deuterosomal = "CDC20B",  
+                          Duct = "RARRES1",  
+                          Duct = "MIA", 
+                          "Goblet 1" = "TFF3", 
+                          "Goblet 1" = "MUC5AC",  
+                          "Goblet 1" = "MUC5B", 
+                          "Goblet 1" = "TFF1", 
+                          "Goblet 1" = "MUC2",  
+                          "Goblet 2 BPIFA2" = "BPIFA2", 
+                          "Goblet 2 PLAU" = "PLAU", 
+                          Hillock = "KRT14",  
+                          Hillock = "KRT6A", 
+                          Hillock = "KRT13", 
+                          Ionocyte = "FOXI1", 
+                          Ionocyte = "ASCL3",  
+                          Melanocyte = "PMEL", 
+                          Melanocyte = "MLANA",
+                          Secretory = "NOS2", 
+                          Secretory = "CAPN13", 
+                          Secretory = "PIGR", 
+                          Squamous = "KRT78", 
+                          Squamous = "SPRR3")
+
+nasal_markers_vector <- as.character(nasal_markers_vector)
+
+myFeatures <- nasal_markers_vector
+Idents(df_nasal_epi) <- factor(df_nasal_epi$cell_state_factor,levels=rev(levels(df_nasal_epi$cell_state_factor)))
+nasal_epi_dotplot <- DotPlot(df_nasal_epi,features=myFeatures,dot.scale=1.7*myScalingFactor) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_nasal_epi)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+nasal_epi_dotplot
+#ggsave(filename = "~/dotplot_markerGenes_nasal_epithelial.pdf",plot = nasal_epi_dotplot,height = 15,width = 30)
+rm(df_nasal_epi)
+gc()
+
+# Nasal immune cells
+df_nasal_immune <- subset(df_nasal,cells=colnames(df_nasal)[!df_nasal$cell_compartment%in%c("Ciliated","Secretory")])
+
+vdj_nasal <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_nasal_vdj.fil5.rds")
+df_nasal_immune$abTCR <- ifelse(colnames(df_nasal_immune)%in%rownames(vdj_nasal)[vdj_nasal$has_ir_tcr=="True" & !is.na(vdj_nasal$has_ir_tcr)],1,0)
+
+
+nasalImmuneMarkers <- unique(c(
+ "CD19",
+ "MS4A1",
+ "IGHA2",
+ "IGHD",
+ "IGHG1",
+ "IGHM",
+ "NCR1",
+ "NCAM1",
+ "GNLY",
+ "abTCR",
+ "CD3D",
+"CD4",
+"CD8A",
+ "CD38",
+"LEF1",
+ "IL7R",
+'ITGAE',
+ "GZMH",
+ "GZMK",
+ "GZMA",
+ "GZMB",
+ "PRF1",
+ "TRGV9",
+ "TRDV2",
+ "TRDV1",
+ "TRDV3",
+ "TRAV1-2",
+ "SLC4A10",
+ "FOXP3",
+ "IL2RA",
+ "FCER1G",
+ "AXL",
+ "SIGLEC6",
+"LAMP3",
+ "CLEC9A",
+'NR4A3','CLEC10A','FCER1A',
+'CD207','CD1C',
+'C1QA',
+'CXCL10',
+"HLA-DRA",
+"HLA-DRB1",
+'TREM2',
+'MT1G',
+'HDC','TPSAB1',
+'CD14','VCAN','S100A8','S100A9',
+ "CLEC4C",
+ "IL3RA",
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+  ))
+
+myFeatures <- nasalImmuneMarkers
+Idents(df_nasal_immune) <- factor(df_nasal_immune$cell_state_factor,levels=rev(levels(df_nasal_immune$cell_state_factor)))
+nasal_immune_dotplot <- DotPlot(df_nasal_immune,features=myFeatures,dot.scale=1.7*myScalingFactor) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_nasal_immune)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+nasal_immune_dotplot
+#ggsave(filename = "~/dotplot_markerGenes_nasal_immune.pdf",plot = nasal_immune_dotplot,height = 15,width = 30)
+rm(df_nasal_immune)
+rm(df_nasal)
+gc()
+
+
+
+#PBMCs
+
+df_pbmc_TNK <- subset(df_pbmc,cells=colnames(df_pbmc)[grepl("^(NK|T|ILC)",df_pbmc$cell_compartment)])
+
+df_pbmc_TNK$cell_state_factor <- droplevels(df_pbmc_TNK$cell_state_factor)
+Idents(df_pbmc_TNK) <- factor(df_pbmc_TNK$cell_state_factor,levels=rev(levels(df_pbmc_TNK$cell_state_factor)))
+
+pbmcTnkMarkers <- unique(c(
+  "TNFRSF18", "TNFRSF4",
+ "GNLY",
+ "NCR1",
+ "NCAM1",
+ "CD3D",
+"CD4",
+"CD8A",
+"SELL",
+"CCR7",
+"CD27",
+"LEF1",
+ "IL7R",
+"CXCR5",
+"SOX4",
+ "GZMH",
+ "GZMK",
+ "GZMA",
+ "GZMB",
+ "PRF1",
+"CCL5", "GATA3", "CCR4", "RORC", "IL17A", "CCR6","CTSH",
+ "TRGV9",
+ "TRDV2",
+ "TRDV1",
+ "TRDV3",
+ "TRAV1-2",
+ "SLC4A10",
+ "FOXP3",
+ "IL2RA",
+ "CD38",
+'ITGAE',
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+))
+myFeatures <- pbmcTnkMarkers
+pbmc_tnk_dotplot <- DotPlot(df_pbmc_TNK,features=myFeatures,dot.scale=1.7*myScalingFactor) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_pbmc_TNK)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+pbmc_tnk_dotplot
+
+#ggsave(filename = "~/dotplot_markerGenes_pbmc_tnk.pdf",plot = pbmc_tnk_dotplot,height = 15,width = 30)
+
+
+
+myFeatures <- c("AB-CD4","AB-CD8A","AB-CD45RA","AB-CD45RO")
+pbmc_tnk_dotplot_adt <- DotPlot(df_pbmc_TNK,assay="ADT",features=myFeatures,dot.scale=1.7*myScalingFactor,cols = c("lightgrey","red")) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_pbmc_TNK)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+pbmc_tnk_dotplot_adt
+
+#ggsave(filename = "~/dotplot_markerGenes_pbmc_tnk_adt.pdf",plot = pbmc_tnk_dotplot_adt,height = 15,width = 30)
+rm(df_pbmc_TNK)
+gc()
+
+### PBMCs non T cells
+
+df_pbmc_B <- subset(df_pbmc,cells=colnames(df_pbmc)[grepl("^(B)",df_pbmc$cell_compartment)])
+
+df_pbmc_B$cell_state_wVDJ_factor <- droplevels(df_pbmc_B$cell_state_wVDJ_factor)
+Idents(df_pbmc_B) <- factor(df_pbmc_B$cell_state_wVDJ_factor,levels=rev(levels(df_pbmc_B$cell_state_wVDJ_factor)))
+
+pbmcBMarkers <- unique(c(
+ "TCL1A",
+ "FCER2",
+ "CD19",
+ "CD24",
+ "CD79A",
+ "MS4A1",
+ "BANK1",
+ "TNFRSF13B",
+ "JCHAIN",
+ "FCRL5",
+ "FCRL3",
+ "IGHA1",
+"IGHA2",
+"IGHD",
+"IGHE",
+"IGHG1",
+"IGHG2",
+"IGHG3",
+"IGHG4",
+"IGHM",
+ "CD38",
+'ITGAE',
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+))
+
+myFeatures <- pbmcBMarkers
+pbmc_b_dotplot <- DotPlot(df_pbmc_B,features=myFeatures,dot.scale=1.7*myScalingFactor) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_pbmc_B)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+pbmc_b_dotplot
+
+#ggsave(filename = "~/dotplot_markerGenes_pbmc_b.pdf",plot = pbmc_b_dotplot,height = 15,width = 30)
+rm(df_pbmc_B)
+gc()
+
+
+
+
+
+df_pbmc_mye <- subset(df_pbmc,cells=colnames(df_pbmc)[!grepl("^(B|T|ILC|NK)",df_pbmc$cell_compartment)])
+
+df_pbmc_mye$cell_state_factor <- droplevels(df_pbmc_mye$cell_state_factor)
+Idents(df_pbmc_mye) <- factor(df_pbmc_mye$cell_state_factor,levels=rev(levels(df_pbmc_mye$cell_state_factor)))
+
+pbmcMyeMarkers <- unique(c(
+ "AXL",
+ "SIGLEC6",
+ "CLEC9A",
+ "CD1C",
+ "FCER1A",
+ "CLEC4C",
+ "IL3RA",
+ "HDC",
+"MS4A2",
+"PRG2",
+"MS4A3",
+"TPSAB1",
+"TPSB2",
+"EPX",
+"CLC",
+"CD34",
+"AVP",
+"CD38",
+"GATA1",
+"MME",
+"MPO",
+"CD14",
+ "IL1B",
+ "CXCL3",
+ "IL6",
+"FCGR3A",
+"C1QA",
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+))
+
+myFeatures <- pbmcMyeMarkers
+pbmc_mye_dotplot <- DotPlot(df_pbmc_mye,features=myFeatures,dot.scale=1.7*myScalingFactor) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5,family = "Helvetica",size = 5*myScalingFactor), axis.text.y = element_text(family = "Helvetica",size = 5*myScalingFactor)) + 
+  force_panelsizes(rows = unit((length(unique(Idents(df_pbmc_mye)))*.17*myScalingFactor), "cm"), cols = unit((length(myFeatures)*.17*myScalingFactor), "cm"))
+pbmc_mye_dotplot
+
+#ggsave(filename = "~/dotplot_markerGenes_pbmc_mye.pdf", plot = pbmc_mye_dotplot, height = 15, width = 30)
+rm(df_pbmc_mye)
+gc()
+
+
+```
+
+

@@ -1,0 +1,1238 @@
+---
+title: "RL007_challengeStudy_PBMCs_processing"
+author: "Rik G.H. Lindeboom"
+date: "29/03/2023"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.height = 7, fig.width = 7)
+```
+
+```{r load required packages, echo=FALSE}
+set.seed(1)
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(harmony))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(sceasy))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(SoupX))
+suppressPackageStartupMessages(library(rvcheck))
+suppressPackageStartupMessages(library(cardelino))
+loompy <- reticulate::import('loompy')
+suppressPackageStartupMessages(library(randomcoloR))
+suppressPackageStartupMessages(library(circlize))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(numDeriv))
+suppressPackageStartupMessages(library(Rsamtools))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(glmmSeq))
+suppressPackageStartupMessages(library(future))
+source("/mnt/scripts/function_collection_rik.R")
+source("/mnt/scripts/glmm_functions_Rik.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Forest.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/getCondVal.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/col.rb.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/drawDendrogram.R")
+source("/home/ubuntu/bin/CellTypeCompositionAnalysis/R/Dotplot.R")
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(leiden))
+suppressPackageStartupMessages(library(ggseqlogo))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ggh4x))
+```
+
+```{r label="load final pbmc object to run without remaking object"}
+df_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmc.fil2.rds")
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+df_pbmc@meta.data[,colnames(dfMeta)] <- dfMeta[rownames(df_pbmc@meta.data),] 
+df_pbmc <- NormalizeData(df_pbmc, assay = "ADT")
+rm(dfMeta)
+```
+
+```{r label="Download PBMC CITE-seq data",eval=FALSE}
+manis <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_citeseq_allPbmcs",stringsAsFactors = F,header = F)
+colnames(manis) <- "citeId"
+outDir <- "/mnt/projects/RL007_challengeStudy/data"
+
+manis$bamReady <- F
+for (i in 1:nrow(manis)) {
+  foo <- tryCatch(system(paste0("ils /archive/HCA/10X/",manis$citeId[i],"/outs/possorted_genome_bam.bam")))
+  if (foo==0) { manis$bamReady[i] <- T } else { manis$bamReady[i] <- F }
+}
+
+for (i in 1:nrow(manis)) {
+  if (manis$bamReady[i]) {
+    cat(manis$citeId[i])
+    if (!dir.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",manis$citeId[i]))) { dir.create(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",manis$citeId[i])) }
+    try(system(paste0("iget -r /archive/HCA/10X/",manis$citeId[i],"/outs/filtered_feature_bc_matrix /archive/HCA/10X/",manis$citeId[i],"/outs/raw_feature_bc_matrix /archive/HCA/10X/",manis$citeId[i],"/outs/metrics_summary.csv /archive/HCA/10X/",manis$citeId[i],"/outs/analysis /mnt/projects/RL007_challengeStudy/data/cite/",manis$citeId[i])))
+    cat("\n\n")
+  }
+}
+
+
+```
+
+```{r label="import cite-seq data",eval=FALSE}
+for (i in manis$citeId) {
+  mySample <- i
+  if (!file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))) { print(paste0(mySample,": data not found")) } else if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,".rds"))) { print(paste0(mySample,": processed rds already found, skipping."))
+  } else {
+    rawData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/raw_feature_bc_matrix/"))
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))
+    clusters <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/analysis/clustering/graphclust/clusters.csv"))
+    
+    # Do SoupX on GEX with default parameters
+    tod = rawData[['Gene Expression']]
+    toc = filData[['Gene Expression']]
+    sc = SoupChannel(tod = tod,toc = toc)
+    sc = setClusters(sc, setNames(clusters$Cluster, clusters$Barcode))
+    #sc = autoEstCont(sc)
+    message = try(sc <- autoEstCont(sc))
+    if (class(message) == 'try-error') { 
+      cat(paste0("SoupX on RNA failed for ",mySample,", raw RNA data returned instead\n")) 
+      filData[["RNA"]] <- filData[['Gene Expression']]
+      soupxRnaFailed <- T
+    } else {
+      out = Matrix::drop0(adjustCounts(sc))
+      filData[["RNA"]] <- out
+      soupxRnaFailed <- F
+    }
+    
+    # Do SoupX on ADT with parameters used by Krzysztof and LFH
+    tod = rawData[['Antibody Capture']]
+    toc = filData[['Antibody Capture']]
+    sc = SoupChannel(tod = tod,toc = toc)
+    sc = setClusters(sc, setNames(clusters$Cluster, clusters$Barcode))
+    soupQuantile = 0.25
+    tfidfMin = 0.2
+    message = try(sc <- autoEstCont(sc, soupQuantile=soupQuantile, tfidfMin=tfidfMin, forceAccept=TRUE))
+    #we really don't want this to fail though. so keep dropping the parameters and trying again
+    #(once tfidMin hits 0.05 the next iteration puts it at 0, so just give up)
+    while ((class(message) == 'try-error') && (tfidfMin > 0.05))
+    {
+      soupQuantile = soupQuantile - 0.05
+      tfidfMin = tfidfMin - 0.05
+      message = try(sc <- autoEstCont(sc, soupQuantile=soupQuantile, tfidfMin=tfidfMin, forceAccept=TRUE))
+    }
+    if (class(message) == 'try-error') { 
+      cat(paste0("SoupX on ADT failed for ",mySample,", raw ADT data returned instead\n")) 
+      filData[["ADT"]] <- filData[['Antibody Capture']]
+      soupxAdtFailed <- T
+    } else {
+      out = Matrix::drop0(adjustCounts(sc))
+      filData[["ADT"]] <- out
+      soupxAdtFailed <- F
+    }
+    
+    fil <- CreateSeuratObject(counts = filData[["RNA"]],min.cells = 0, min.features = 200,project = mySample,assay = "RNA")
+    fil[["ADT"]] <- CreateAssayObject(counts = filData[["ADT"]][,colnames(fil)])
+    fil@meta.data$soupxOnAdt <- ifelse(soupxAdtFailed,"Fail","Pass")
+    fil@meta.data$soupxOnRna <- ifelse(soupxRnaFailed,"Fail","Pass")
+    write_rds(fil,file=paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,".rds"),compress = "gz")
+    cat(paste0("Sample ",mySample," done.\n"))
+    gc()
+  }
+}
+
+# We have to make individual rds' first to prevent memory issues. We'll merge later
+```
+
+```{r label="also make raw GEX object for sharing and celltypist",eval=FALSE}
+rm(fil)
+for (mySample in manis$citeId) {
+  if (!file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))) { print(paste0(mySample,": data not found")) } else {
+    filData = Read10X(data.dir = paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,"/filtered_feature_bc_matrix/"))
+    
+    filSample <- CreateSeuratObject(counts = filData[['Gene Expression']],min.cells = 0, min.features = 200,project = mySample,assay = "RNA")
+    filSample[["ADT"]] <- CreateAssayObject(counts = filData[['Antibody Capture']][,colnames(filData)])
+    
+    filSample <- RenameCells(filSample,add.cell.id = mySample)
+    filSample <- subset(filSample,cells=colnames(filSample)[colnames(filSample)%in%rownames(dfMeta)])
+    
+    if (!exists("fil")) {
+      fil <- filSample
+    } else {
+      if (sum(rownames(fil@meta.data) %in% rownames(filSample@meta.data))>0) { halt }
+      fil <- merge(fil, y = filSample, project = "COVID-19 Challenge Project - raw GEX - PBMCs")
+    }
+    rm(filData)
+    rm(filSample)
+    gc()
+  }
+}
+
+write_rds(fil,"/mnt/projects/RL007_challengeStudy/data/df_pbmc_rawGex.fil2.rds")
+```
+
+```{r label="merge soupxed CITE object",eval=FALSE}
+rm(fil)
+for (i in manis$citeId) {
+  mySample <- i
+  if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,".rds"))) {
+    filSample <- read_rds(paste0("/mnt/projects/RL007_challengeStudy/data/cite/",mySample,".rds"))
+    DefaultAssay(filSample) <- "RNA"
+    filSample <- RenameCells(filSample,add.cell.id = mySample)
+    if (!exists("fil")) {
+      fil <- filSample
+    } else {
+      if (sum(rownames(fil@meta.data) %in% rownames(filSample@meta.data))>0) { halt }
+      fil <- merge(fil, y = filSample, project = "COVID-19 Challenge Project - PBMCs")
+    }
+    rm(filSample)
+    gc()
+  }
+}
+```
+
+```{r label="normalise and remove low quality cells based on GEX of the PBMCs",eval=FALSE}
+df_pbmc <- NormalizeData(df_pbmc, assay = "RNA")
+df_pbmc <- FindVariableFeatures(df_pbmc)
+df_pbmc <- ScaleData(df_pbmc)
+df_pbmc <- RunPCA(df_pbmc,reduction.name = "pca_RNA")
+df_pbmc <- RunUMAP(df_pbmc,reduction = "pca_RNA", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapBeforeHarmony_RNA_')
+DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by="orig.ident",shuffle = T,cols=randomColor(length(unique(df_pbmc$orig.ident))),pt.size = .001,raster = F) + theme(aspect.ratio = 1) + NoLegend()
+FeaturePlot(df_pbmc,reduction="umapBeforeHarmony_RNA",features = c("CD3D","CD8A","CCR7","GNLY","CD79A","PF4","nCount_RNA","FCER1A","IFI44L"))
+FeaturePlot(df_pbmc,reduction="umapBeforeHarmony_RNA",features = c("CD14","CD8A","CCR7","GNLY","CD79A","PF4","nCount_RNA","FCER1A","nCount_RNA"),max.cutoff = "q90")
+
+df_pbmc[["percentMito"]] <- PercentageFeatureSet(df_pbmc, pattern = "^MT-")
+
+# We can be stringent here because PBMCs should be of much higher quality compared to epithelial cells, tinkering around shows that mt10% and at least 2000 umis works great and removes all quality related batch effects
+df_pbmc <- subset(df_pbmc,cells=rownames(df_pbmc@meta.data)[df_pbmc$percentMito<10 & df_pbmc$nCount_RNA>2000])
+df_pbmc <- NormalizeData(df_pbmc, assay = "RNA")
+df_pbmc <- FindVariableFeatures(df_pbmc)
+df_pbmc <- ScaleData(df_pbmc)
+df_pbmc <- RunPCA(df_pbmc,reduction.name = "pca_RNA")
+df_pbmc <- RunUMAP(df_pbmc,reduction = "pca_RNA", dims = 1:30,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapBeforeHarmony_RNA_')
+gc()
+df_pbmc <- RunHarmony(df_pbmc, group.by.vars = "orig.ident",assay.use = "RNA",reduction = "pca_RNA",reduction.save = "harmony_RNA")
+df_pbmc <- RunUMAP(df_pbmc,reduction = "harmony_RNA", dims = 1:30,reduction.name = "umapAfterHarmony_RNA",reduction.key='umapAfterHarmony_RNA_')
+
+df_pbmc <- FindNeighbors(df_pbmc, dims = 1:30,reduction = "harmony_RNA",graph.name="harmony_snn")
+df_pbmc <- FindClusters(df_pbmc, graph.name = "harmony_snn", resolution = c(.5,4),algorithm = 4,method="igraph")
+
+write_rds(df_pbmc,file="/mnt/projects/RL007_challengeStudy/data/df_pbmc_pbmc.fil1.rds",compress = "gz")
+
+```
+
+```{r label="add celltypist labels to PBMCs to aid the annotation",eval=FALSE}
+for (i in c("yoshida_broad","haniffa_broad","celltypist_broad","yoshida_detailed","haniffa_detailed","celltypist_detailed")) {
+  labels <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,"_pbmcSubset1.predicted_labels.csv"),header = T,stringsAsFactors = F)
+  probs <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,"_pbmcSubset1.probability_matrix.csv"),header = T,stringsAsFactors = F)
+  probs$max <- apply(probs[,2:ncol(probs)],1,max)
+  labels <- labels[labels$X%in%rownames(df_pbmc@meta.data),]
+  probs <- probs[probs$X%in%rownames(df_pbmc@meta.data),]
+  df_pbmc@meta.data[labels$X,paste0(i,"_predLabel")] <- labels$predicted_labels
+  df_pbmc@meta.data[probs$X,paste0(i,"_maxPredProb")] <- probs$max
+  labels <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,"_pbmcSubset2.predicted_labels.csv"),header = T,stringsAsFactors = F)
+  probs <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/celltypist/",i,"_pbmcSubset2.probability_matrix.csv"),header = T,stringsAsFactors = F)
+  probs$max <- apply(probs[,2:ncol(probs)],1,max)
+  labels <- labels[labels$X%in%rownames(df_pbmc@meta.data),]
+  probs <- probs[probs$X%in%rownames(df_pbmc@meta.data),]
+  df_pbmc@meta.data[labels$X,paste0(i,"_predLabel")] <- labels$predicted_labels
+  df_pbmc@meta.data[probs$X,paste0(i,"_maxPredProb")] <- probs$max
+}
+
+DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by="yoshida_detailed_predLabel",shuffle = T,cols=randomColor(length(unique(df_pbmc$yoshida_detailed_predLabel))),pt.size = .001,raster = F,label=T,repel = T) + theme(aspect.ratio = 1) + NoLegend()
+```
+
+```{r label="Add library level metadata to PBMCs",eval=FALSE}
+libraryMeta <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/Human_challenge_samples_processed_4th.xlsx_-_PBMC_pools_proc.txt",header = T,sep = "\t",stringsAsFactors = F)
+matchTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_toSampleName_allGexPbmcs.txt",header = F,sep = "\t",stringsAsFactors = F)
+colnames(matchTable) <- c("gexId","pool_id_gex")
+allCiteNames <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_citeseq_allPbmcs",header = F,sep = "\t",stringsAsFactors = F)
+colnames(allCiteNames) <- "orig.ident"
+allCiteNames$gexId <- gsub("(.*?)\\+.*","\\1",allCiteNames$orig.ident)
+matchTableCite <- merge(matchTable,allCiteNames,by="gexId")
+matchTableCite$Pool.ID <- gsub("_G$","",matchTableCite$pool_id_gex)
+libraryMetaCite <- merge(libraryMeta,matchTableCite[,c("Pool.ID","orig.ident")],by="Pool.ID")
+libraryMetaCite$patient_timepoint <- paste(libraryMetaCite$Hvivo.patient.ID,libraryMetaCite$Time.point,sep = ";")
+
+genotypeTable <- as.data.frame(table(libraryMetaCite$orig.ident),stringsAsFactors = F)
+
+uniqueLibraryMetaCite <- libraryMetaCite[!duplicated(libraryMetaCite$orig.ident),]
+uniqueLibraryMetaCite$samplesPresent <- as.character(sapply(uniqueLibraryMetaCite$orig.ident,function(x) paste(libraryMetaCite$patient_timepoint[libraryMetaCite$orig.ident==x],collapse = "+")))
+rownames(uniqueLibraryMetaCite) <- uniqueLibraryMetaCite$orig.ident
+
+df_pbmc@meta.data[,c("samples_in_pool","target_cell_number_per_pool","PCR_cycles","cDNA_storage_temp","Viability","AB_vial_added")] <-  uniqueLibraryMetaCite[df_pbmc$orig.ident,c("samplesPresent","Taget.cell.recovery","PCR.cycles","cDNA.storage","Vibaility","CITE.seq.vial")]
+
+```
+
+```{r label="import souporcell labels",eval=FALSE}
+for (i in unique(df_pbmc$orig.ident)) {
+  myClusters <- read.csv(paste0("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/",i,"/clusters.tsv"),sep="\t",stringsAsFactor=F,header = T)
+  myClusters$matched_barcode <- paste(i,myClusters$barcode,sep="_")
+  myClusters <- myClusters[myClusters$matched_barcode%in%rownames(df_pbmc@meta.data),]
+  df_pbmc@meta.data[myClusters$matched_barcode,c("souporcell_status","souporcell_cluster")] <- myClusters[,c("status","assignment")]
+}
+
+```
+
+```{r label="souporcell genotyping based on references",eval=FALSE}
+# Patient_IDs were added to souporcell clusters using 2 approaches. First, we have genotyping data for most of the patients. Second, we have generated VCFs based on the scRNA-seq data of the nasopharyngeal data from the same patients.
+
+gt_list <- list()
+for (i in unique(df_pbmc@meta.data$orig.ident)) {
+  if (file.exists(paste0("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/",i,"/cluster_genotypes.vcf.gz"))) {
+    cell_data <- as.data.frame(load_GT_vcf(paste0("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/",i,"/cluster_genotypes.vcf.gz"),na.rm = F)$GT,stringsAsFactors = F)
+    colnames(cell_data) <- paste0(i,"_",colnames(cell_data))
+    gt_list[[i]] <- cell_data
+  }
+}
+
+for (i in names(gt_list)) {
+  print(i)
+  print(nrow(gt_list[[i]]))
+}
+
+allClusters <- c()
+for (sample in names(gt_list)) {
+  for (cluster in colnames(gt_list[[sample]])) {
+    allClusters <- c(allClusters,cluster)
+  }
+}
+
+# ref_data is here the SNParray based genotyping data
+ref_data <- as.data.frame(load_GT_vcf("/mnt/projects/RL007_challengeStudy/souporcell/RepeatPlate.fixref.hg38.vcf",na.rm = F)$GT,stringsAsFactors = F)
+
+corTable <- as.data.frame(matrix(nrow=length(allClusters),ncol=length(colnames(ref_data))))
+colnames(corTable) <- colnames(ref_data)
+rownames(corTable) <- allClusters
+
+for (a in colnames(corTable)) {
+  sample_a_gt <- ref_data[,a]
+  names(sample_a_gt) <- rownames(ref_data)
+  sample_a_gt <- sample_a_gt[!is.na(sample_a_gt)]
+  for (b in rownames(corTable)) {
+    sample_b <- gsub("_[0-9]*$","",b)
+    sample_b_gt <- gt_list[[sample_b]][,b]
+    names(sample_b_gt) <- rownames(gt_list[[sample_b]])
+    sample_b_gt <- sample_b_gt[!is.na(sample_b_gt) & names(sample_b_gt)%in%names(sample_a_gt)]
+    sample_b_gt <- sample_b_gt[order(names(sample_b_gt))]
+    sample_a_gt_temp <- sample_a_gt[names(sample_a_gt)%in%names(sample_b_gt)]
+    sample_a_gt_temp <- sample_a_gt_temp[order(names(sample_a_gt_temp))]
+    if (any(names(sample_b_gt)!=names(sample_a_gt_temp))) { halt }
+    myCor <- sum(sample_a_gt_temp==sample_b_gt)/length(sample_a_gt_temp)
+    corTable[b,a] <- myCor
+    #if (is.na(myCor)) { halt }
+  }
+  print(a)
+}
+write_rds(corTable,file="/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/corTable.rds")
+```
+
+```{r label="visualise souporcell genotyping based on references",fig.height=15,fig.width=8}
+corTable <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/corTable.rds")
+
+Heatmap(corTable,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+corTableFil <- corTable
+corTableFil[corTableFil<.75] <- 0
+Heatmap(corTableFil,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+# Up to UCL16 were challenge samples
+```
+
+```{r label="genotyping based on souporcell genotype matching",eval=FALSE}
+# Instead of matching to a reference, we also match the souporcell genotypes to eachother to visualize genotype clusters for which we do not have reference genotypes
+corTable_soc <- as.data.frame(matrix(nrow=length(allClusters),ncol=length(allClusters)))
+colnames(corTable_soc) <- allClusters
+rownames(corTable_soc) <- allClusters
+
+for (a in colnames(corTable_soc)) {
+  sample_a <- gsub("_[0-9]*$","",a)
+  sample_a_gt <- gt_list[[sample_a]][,a]
+  names(sample_a_gt) <- rownames(gt_list[[sample_a]])
+  sample_a_gt <- sample_a_gt[!is.na(sample_a_gt)]
+  for (b in rownames(corTable_soc)) {
+    sample_b <- gsub("_[0-9]*$","",b)
+    sample_b_gt <- gt_list[[sample_b]][,b]
+    names(sample_b_gt) <- rownames(gt_list[[sample_b]])
+    sample_b_gt <- sample_b_gt[!is.na(sample_b_gt) & names(sample_b_gt)%in%names(sample_a_gt)]
+    sample_b_gt <- sample_b_gt[order(names(sample_b_gt))]
+    sample_a_gt_temp <- sample_a_gt[names(sample_a_gt)%in%names(sample_b_gt)]
+    sample_a_gt_temp <- sample_a_gt_temp[order(names(sample_a_gt_temp))]
+    if (any(names(sample_b_gt)!=names(sample_a_gt_temp))) { halt }
+    myCor <- sum(sample_a_gt_temp==sample_b_gt)/length(sample_a_gt_temp)
+    corTable_soc[b,a] <- myCor
+    #if (is.na(myCor)) { halt }
+  }
+  print(a)
+}
+write_rds(corTable_soc,file="/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/corTable_soc.rds")
+```
+
+```{r label="visualise genotyping based on souporcell genotype matching"}
+corTable_soc <- read_rds("/mnt/projects/RL007_challengeStudy/souporcell/pbmcs/corTable_soc.rds")
+
+Heatmap(corTable_soc,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+```
+
+```{r label="annotate patient_ids using souporcell clusters",fig.height=15,fig.width=15}
+corTable_socFil <- corTable_soc
+corTable_socFil[corTable_socFil<.65] <- 0
+Heatmap(corTable_socFil,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+corTable_soc_annotated <- corTable_soc
+for (i in rownames(corTableFil)) { 
+  if (sum(corTableFil[i,]>0)>0) {
+    matchedSample <- unique(colnames(corTableFil)[corTableFil[i,]>0])
+    rownames(corTable_soc_annotated)[rownames(corTable_soc_annotated)==i] <- paste(matchedSample,i,sep=";")
+  }
+}
+Heatmap(corTable_soc_annotated,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+
+
+# A handful of souporcell clusters remained unresolved, so we manually inspected and fixed them (based on similarity to other clusters and sex specific gene expression)
+# At the end only 2 clusters remained unannotated, which were removed from the single cell object
+myOrderedRowNames <- rownames(corTable_soc_annotated)[hclust(dist(corTable_soc_annotated))$order][!grepl("UCL",rownames(corTable_soc_annotated)[hclust(dist(corTable_soc_annotated))$order])]
+Heatmap(corTable_soc_annotated[myOrderedRowNames,],col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5),cluster_rows = F)
+
+
+missingUcl10s <- c("COV19_CH11286529+COV19_CH11408299_2","COV19_CH11286534+COV19_CH11408304_3")
+for (i in missingUcl10s) { 
+  rownames(corTable_soc_annotated)[rownames(corTable_soc_annotated)==i] <- paste("UCL_10",i,sep=";")
+}
+
+missingPatient_1 <- c("COV19_CH11286550+COV19_CH11408320_1", "COV19_CH11286538+COV19_CH11408308_3", "COV19_CH11286543+COV19_CH11408313_0", "COV19_CH11286531+COV19_CH11408301_1", "COV19_CH11286533+COV19_CH11408303_0", "COV19_CH11286548+COV19_CH11408318_0")
+for (i in missingPatient_1) { 
+  rownames(corTable_soc_annotated)[rownames(corTable_soc_annotated)==i] <- paste("missingPatient_1",i,sep=";")
+}
+
+missingPatient_2 <- c("COV19_CH11286521+COV19_CH11408291_3", "COV19_CH11286524+COV19_CH11408294_1", "COV19_CH11286528+COV19_CH11408298_3", "COV19_CH11286527+COV19_CH11408297_1", "COV19_CH11286547+COV19_CH11408317_3", "COV19_CH11286549+COV19_CH11408319_0", "COV19_CH11286546+COV19_CH11408316_3", "COV19_CH11286522+COV19_CH11408292_0", "COV19_CH11286550+COV19_CH11408320_3", "COV19_CH11286515+COV19_CH11408325_1", "COV19_CH11286518+COV19_CH11408328_2", "COV19_CH11286513+COV19_CH11408323_1")
+for (i in missingPatient_2) { 
+  rownames(corTable_soc_annotated)[rownames(corTable_soc_annotated)==i] <- paste("missingPatient_2",i,sep=";")
+}
+Heatmap(corTable_soc_annotated,col = colorRamp2(c(0.4,1),c("white","black")),column_names_gp = gpar(fontsize=5),row_names_gp = gpar(fontsize=5))
+```
+
+```{r label="annotate ucl ids in citeseq object",eval=FALSE}
+# Annotate df_pbmc
+df_pbmc$souporcell_cluster_matched <- paste(df_pbmc$orig.ident,df_pbmc$souporcell_cluster,sep="_")
+df_pbmc$ucl_id <- NA
+
+for (i in rownames(corTable_soc_annotated)) {
+  if (grepl("(UCL_|missing)",i)) {
+    patient_id <- gsub("(.*?);(.*)","\\1",i)
+    souporcell_cluster <- gsub("(.*?);(.*)","\\2",i)
+    df_pbmc$ucl_id[df_pbmc$souporcell_cluster_matched==souporcell_cluster] <- patient_id
+  }
+}
+
+```
+
+```{r label="add patient level metadata and fix missing patients from souporcell analysis",eval=FALSE}
+libraryMeta <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/Human_challenge_samples_processed_4th.xlsx_-_PBMC_pools_proc.txt",header = T,sep = "\t",stringsAsFactors = F)
+matchTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_toSampleName_allGexPbmcs.txt",header = F,sep = "\t",stringsAsFactors = F)
+colnames(matchTable) <- c("gexId","pool_id_gex")
+allCiteNames <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_citeseq_allPbmcs",header = F,sep = "\t",stringsAsFactors = F)
+colnames(allCiteNames) <- "orig.ident"
+allCiteNames$gexId <- gsub("(.*?)\\+.*","\\1",allCiteNames$orig.ident)
+matchTableCite <- merge(matchTable,allCiteNames,by="gexId")
+matchTableCite$Pool.ID <- gsub("_G$","",matchTableCite$pool_id_gex)
+libraryMetaCite <- merge(libraryMeta,matchTableCite[,c("Pool.ID","orig.ident")],by="Pool.ID")
+libraryMetaCite$Time.point <- gsub(" ","",libraryMetaCite$Time.point)
+libraryMetaCite$patient_timepoint <- paste(libraryMetaCite$Hvivo.patient.ID,libraryMetaCite$Time.point,sep = ";")
+libraryMetaCite$orig.ident_patient <- paste(libraryMetaCite$orig.ident,libraryMetaCite$Hvivo.patient.ID,sep=";")
+rownames(libraryMetaCite) <- libraryMetaCite$orig.ident_patient
+
+demographics <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/COVHIC001_Demog_Q5andQ6_only.txt",header = T,stringsAsFactors = F,sep = "\t",blank.lines.skip = T)
+demographics <- demographics[!is.na(demographics$Subject),]
+rownames(demographics) <- as.character(demographics$Subject)
+
+genotypeNames <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/genotypeNames_to_hVivoIds.txt",sep="\t",stringsAsFactors = F,header = T)
+rownames(genotypeNames) <- genotypeNames$Sample.Name..CGS.
+
+df_pbmc$patient_id <- genotypeNames[df_pbmc$ucl_id,"UCL.Sample.ID"]
+
+df_temp <- subset(df_pbmc,cells=colnames(df_pbmc)[!is.na(df_pbmc$ucl_id)])
+DotPlot(df_temp,features = c("XIST","DDX3Y"),group.by="ucl_id")
+# OK so 636163 has to be missingPatient_2 and missingPatient_1 is 673216
+df_pbmc$patient_id[df_pbmc$ucl_id=="missingPatient_2" & !is.na(df_pbmc$ucl_id)] <- "636163"
+df_pbmc$patient_id[df_pbmc$ucl_id=="missingPatient_1" & !is.na(df_pbmc$ucl_id)] <- "673216"
+df_pbmc$patient_id[df_pbmc$ucl_id=="UCL_2" & !is.na(df_pbmc$ucl_id)] <- "635779" # This one was wrong in the manifest
+
+df_pbmc$time_point <- libraryMetaCite[paste(df_pbmc$orig.ident,df_pbmc$patient_id,sep=";"),"Time.point"]
+
+df_pbmc$sample_id <- paste(df_pbmc$patient_id,df_pbmc$time_point,sep=";")
+
+infectedTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/metadata_infected_hlaCompatible_byKayleeMail.txt",sep = "\t",header = T,stringsAsFactors = F)
+rownames(infectedTable) <- as.character(infectedTable$Sample.ID)
+df_pbmc@meta.data[,c("covid_status","hlaCompatibleWDextramers")] <- infectedTable[df_pbmc$patient_id,c("Disease.status","Compatible.HLA")]
+df_pbmc@meta.data[,c("age","sex","ethnicity","race","race_details","allergies","time_of_challenge")] <- demographics[df_pbmc$patient_id,c("Age.at.Screening","Sex","Ethnicity","Race","Race...Other","Any.allergies","Challenge.Virus.Date.Time")]
+```
+
+```{r label="subset PBMCs and recluster major compartments for manual cell type annotation",eval=FALSE}
+DefaultAssay(df_pbmc) <- "RNA"
+NormalizeData(df_pbmc, assay = "RNA")
+df_pbmc <- FindVariableFeatures(df_pbmc,nfeatures=5000)
+df_pbmc <- ScaleData(df_pbmc)
+df_pbmc <- RunPCA(df_pbmc,reduction.name = "pca_RNA")
+df_pbmc <- RunUMAP(df_pbmc,reduction = "pca_RNA", dims = 1:50,reduction.name = "umapBeforeHarmony_RNA",reduction.key='umapAfterHarmony_RNA_')
+df_pbmc <- FindNeighbors(df_pbmc, dims = 1:50,reduction = "pca_RNA",graph.name="RNA_snn")
+df_pbmc <- FindClusters(df_pbmc, graph.name = "RNA_snn", resolution = c(.5,4,32),algorithm = 4,method="igraph")
+
+(DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by = "RNA_snn_res.0.5",label = T,raster=F) + NoLegend()) +
+  (DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by = "RNA_snn_res.4",label = T,raster=F) + NoLegend()) +
+  (DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by = "yoshida_broad_predLabel",label = T,raster = F) + NoLegend()) + patchwork::plot_layout(nrow=2)
+
+DefaultAssay(df_pbmc) <- "RNA"
+df_pbmc <- CellCycleScoring(df_pbmc, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = F)
+
+df_pbmc$cell_type_compartment <- "T"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(1,10,13,20,18,6,12,16,24)] <- "Myeloid"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(8,9)] <- "B"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(19)] <- "B_ABS"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(21)] <- "HPC"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.4%in%c(43,66,59)] <- "pDC"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(22)] <- "cDC1"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(25)] <- "RBC"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(4)] <- "NK"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.0.5%in%c(17)] <- "Cycling"
+df_pbmc$cell_type_compartment[df_pbmc$RNA_snn_res.4%in%c(60)] <- "T"
+(DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by = "RNA_snn_res.0.5",label = T,raster=F) + NoLegend()) +
+  (DimPlot(df_pbmc,reduction="umapBeforeHarmony_RNA",group.by = "cell_type_compartment",label = T,raster = F) + NoLegend()) + patchwork::plot_layout(nrow=2)
+
+
+for (i in c("T", "NK", "Cycling", "B", "Myeloid", "pDC", "HPC", "B_ABS", "cDC1", "RBC")) {
+  df_pbmc <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmc_pbmc.fil1.rds")
+  df_pbmc@meta.data[,colnames(df_pbmcMeta)[!colnames(df_pbmcMeta)%in%colnames(df_pbmc@meta.data)]] <- df_pbmcMeta[rownames(df_pbmc@meta.data),colnames(df_pbmcMeta)[!colnames(df_pbmcMeta)%in%colnames(df_pbmc@meta.data)]] 
+  df_pbmc_subset <- subset(df_pbmc,cells=rownames(df_pbmc@meta.data)[df_pbmc$cell_type_compartment==i])
+  df_pbmc_subset <- DietSeurat(df_pbmc_subset)
+  rm(df_pbmc)
+  gc()
+  DefaultAssay(df_pbmc_subset) <- "RNA"
+  df_pbmc_subset <- NormalizeData(df_pbmc_subset, assay = "RNA")
+  for (nhvgs in c(500,1000,2000,4000)) {
+    df_pbmc_subset <- FindVariableFeatures(df_pbmc_subset,nfeatures=nhvgs) %>% ScaleData() %>% RunPCA(reduction.name = paste0("pca_RNA_",nhvgs,"hvgs"),npcs = 30) %>% RunUMAP(reduction = paste0("pca_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_RNA_",nhvgs,"hvgs"), reduction.key=paste0("umap_RNA_",nhvgs,"hvgs_"))
+    df_pbmc_subset <- FindNeighbors(df_pbmc_subset, dims = 1:30,reduction = paste0("pca_RNA_",nhvgs,"hvgs"), graph.name=paste0("rna_snn_",nhvgs,"hvgs"))
+    df_pbmc_subset <- FindClusters(df_pbmc_subset, graph.name = paste0("rna_snn_",nhvgs,"hvgs"), resolution = c(1,4,32),algorithm = 4, method="igraph")
+  }
+  
+  # DefaultAssay(df_subset) <- "ADT"
+  # df_subset <- NormalizeData(df_subset, assay = "ADT",normalization.method = "CLR",margin = 2)
+  # VariableFeatures(df_subset) <- rownames(df_subset[["ADT"]])
+  # df_subset <- ScaleData(df_subset)
+  # df_subset <- RunPCA(df_subset,reduction.name = "pca_ADT")
+  # df_subset <- RunHarmony(df_subset, group.by.vars = "orig.ident",assay.use = "ADT",reduction = "pca_ADT",reduction.save = "harmony_ADT")
+  # df_subset <- RunUMAP(df_subset,reduction = "harmony_ADT", dims = 1:30,reduction.name = "umapAfterHarmony_ADT",reduction.key='umapAfterHarmony_ADT_')
+  # df_subset <- RunUMAP(df_subset,reduction = "pca_ADT", dims = 1:30,reduction.name = "umapBeforeHarmony_ADT",reduction.key='umapBeforeHarmony_ADT_')
+  # df_subset <- FindNeighbors(df_subset, dims = 1:30,reduction = "pca_ADT",graph.name="ADT_snn")
+  # df_subset <- FindClusters(df_subset, graph.name = "ADT_snn", resolution = c(.5,4,32),algorithm = 4,method="igraph")
+  # 
+  write_rds(df_pbmc_subset,file = paste0("/mnt/projects/RL007_challengeStudy/data/df_pbmcs.",i,".rds"), compress = "gz")
+  rm(df_pbmc_subset)
+  gc() 
+  print(paste(i,"done"))
+  #}
+}
+
+```
+
+```{r label="download PBMC VDJ data",eval=FALSE}
+libraryMeta <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/Human_challenge_samples_processed_4th.xlsx_-_PBMC_pools_proc.txt",header = T,sep = "\t",stringsAsFactors = F)
+matchTable <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_toSampleName_allGexPbmcs.txt",header = F,sep = "\t",stringsAsFactors = F)
+colnames(matchTable) <- c("gexId","pool_id_gex")
+allCiteNames <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_citeseq_allPbmcs",header = F,sep = "\t",stringsAsFactors = F)
+colnames(allCiteNames) <- "orig.ident"
+allCiteNames$gexId <- gsub("(.*?)\\+.*","\\1",allCiteNames$orig.ident)
+matchTableCite <- merge(matchTable,allCiteNames,by="gexId")
+matchTableCite$Pool.ID <- gsub("_G$","",matchTableCite$pool_id_gex)
+myPoolIds <- matchTableCite$Pool.ID[!duplicated(matchTableCite$orig.ident)]
+names(myPoolIds) <- matchTableCite$orig.ident[!duplicated(matchTableCite$orig.ident)]
+
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil1.rds")
+dfMeta$pool_id <- myPoolIds[dfMeta$orig.ident]
+
+manis <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/sampleIds_citeseq_allPbmcs",stringsAsFactors = F,header = F)
+colnames(manis) <- "citeId"
+manis$pool_id <- myPoolIds[manis$citeId]
+outDir <- "/mnt/projects/RL007_challengeStudy/data"
+
+pbmcBcr <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/pbmc_bcrs.txt",sep = "\t",header = F,stringsAsFactors = F)
+pbmcBcr$pool_id <- gsub("(.*)_B","\\1",pbmcBcr$V2)
+colnames(pbmcBcr) <- c("bcrId","bcrName","pool_id")
+rownames(pbmcBcr) <- pbmcBcr$pool_id
+manis$bcrId <- pbmcBcr[manis$pool_id,"bcrId"]
+dfMeta$bcrId <- pbmcBcr[dfMeta$pool_id,"bcrId"]
+
+pbmcTcr <- read.csv("/mnt/projects/RL007_challengeStudy/metadata/pbmc_tcrs.txt",sep = "\t",header = F,stringsAsFactors = F)
+pbmcTcr$pool_id <- pbmcTcr$V2
+colnames(pbmcTcr) <- c("tcrId","tcrName","pool_id")
+rownames(pbmcTcr) <- pbmcTcr$pool_id
+manis$tcrId <- pbmcTcr[manis$pool_id,"tcrId"]
+dfMeta$tcrId <- pbmcTcr[dfMeta$pool_id,"tcrId"]
+
+for (i in 1:nrow(manis)) {
+  cat(manis$citeId[i])
+  if (!dir.exists(paste0(outDir,"/tcr/",manis$tcrId[i]))) { dir.create(paste0(outDir,"/tcr/",manis$tcrId[i])) }
+  if (!dir.exists(paste0(outDir,"/bcr/",manis$bcrId[i]))) { dir.create(paste0(outDir,"/bcr/",manis$bcrId[i])) }
+  try(system(paste0("iget -r /archive/HCA/10X-VDJ/",manis$bcrId[i],"/ig/filtered_contig.fasta /archive/HCA/10X-VDJ/",manis$bcrId[i],"/ig/filtered_contig_annotations.csv ",outDir,"/bcr/",manis$bcrId[i])))
+  try(system(paste0("iget -r /archive/HCA/10X-VDJ/",manis$tcrId[i],"/tr/filtered_contig.fasta /archive/HCA/10X-VDJ/",manis$tcrId[i],"/tr/filtered_contig_annotations.csv ",outDir,"/tcr/",manis$tcrId[i])))
+  cat("\n\n")
+}
+
+```
+
+```{python label='run scirpy to add vdj',eval=FALSE}
+# py_install(pip = T,packages = "scirpy")
+import sys
+import warnings
+
+import numpy as np
+import pandas as pd
+import pandas
+
+import scanpy as sc
+import scirpy as ir
+from matplotlib import pyplot as plt
+import seaborn as sns
+import matplotlib.pyplot as plt
+import scipy.stats
+import scipy as sp
+import anndata
+import os
+from glob import glob
+
+meta_GEX_VDJ = r.manis.set_index('bcrId')
+meta_GEX_VDJ.head(3)
+
+holder = []
+
+for sample_vdj in meta_GEX_VDJ.index:
+holder.append(ir.io.read_10x_vdj('/mnt/projects/RL007_challengeStudy/data/bcr/'+sample_vdj+'/filtered_contig_annotations.csv'))
+
+sample_gex = meta_GEX_VDJ.loc[sample_vdj, 'citeId']
+holder[-1].obs_names = [sample_gex+'_'+i.split('-')[0] for i in holder[-1].obs_names]
+
+adata_bcr = pd.concat([i.obs for i in holder])
+adata_bcr.to_csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv")
+
+#Do the same for TCR
+meta_GEX_VDJ = r.manis.set_index('tcrId')
+meta_GEX_VDJ.head(3)
+
+holder = []
+
+for sample_vdj in meta_GEX_VDJ.index:
+holder.append(ir.io.read_10x_vdj('/mnt/projects/RL007_challengeStudy/data/tcr/'+sample_vdj+'/filtered_contig_annotations.csv'))
+
+sample_gex = meta_GEX_VDJ.loc[sample_vdj, 'citeId']
+holder[-1].obs_names = [sample_gex+'_'+i.split('-')[0] for i in holder[-1].obs_names]
+
+adata_tcr = pd.concat([i.obs for i in holder])
+adata_tcr.to_csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_220303_fromScirpy.csv")
+```
+
+```{r label="import VDJ data",eval=FALSE}
+dfMeta <- read_rds("/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc.fil4.rds")
+
+myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myBcrs <- myBcrs[paste0(myBcrs$X,"-1")%in%rownames(dfMeta),]
+colnames(myBcrs) <- paste0(colnames(myBcrs),"_bcr")
+
+dfMeta[paste0(myBcrs$X,"-1"),colnames(myBcrs)[!colnames(myBcrs)%in%c(colnames(df),"X_bcr")]] <- myBcrs[,!colnames(myBcrs)%in%c(colnames(df),"X_bcr")]
+
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+
+myTcrs <- myTcrs[paste0(myTcrs$X,"-1")%in%rownames(dfMeta),]
+colnames(myTcrs) <- paste0(colnames(myTcrs),"_tcr")
+
+dfMeta[paste0(myTcrs$X,"-1"),colnames(myTcrs)[!colnames(myTcrs)%in%c(colnames(df),"X_tcr")]] <- myTcrs[,!colnames(myTcrs)%in%c(colnames(df),"X_tcr")]
+
+write_rds(dfMeta,file="/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc_vdj.fil4.rds",compress = "gz")
+write.table(dfMeta,file="/mnt/projects/RL007_challengeStudy/data/dfMeta_pbmc_vdj.fil4.tsv",col.names = T,row.names = T,sep = "\t")
+```
+
+```{r label="manually annotate PBMC T cell cluster",eval=FALSE}
+# Cell type annotation was highly manual and done in an iterative manner going back and forth between experts and analysts over the course of several months
+# We always take the approach: leiden clustering -> annotation using marker and differential genes -> subset annotation -> leiden clustering -> annotation using marker and differential genes -> subset annotation -> etc 
+# This iterative annotation is performed until no more biologically meaningful differences between clusters is observed (according to experts)
+# Because of the manual and multidisciplinary nature of this process, we only show the typical workflow in this chunck to prevent cluttering of this markdown file with 1000s of lines of annotation code repetitions
+# In this example we partially annotated T cells. Note that these annotations were manually refined afterwards and does not match the annotation in the paper
+
+# available compartments: c("T", "NK", "Cycling", "B", "Myeloid", "pDC", "HPC", "B_ABS", "cDC1", "RBC")
+dfs <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcs.T.rds")
+
+dfs$time_point_factor <- factor(dfs$time_point,levels=c("D-1","D3","D7","D10","D14","D28"))
+stimGenes <- rev(c("IRF7", "XAF1", "UBE2L6", "TRIM22", "STAT1", "SP110", "SAMD9L", "SAMD9", "PLSCR1", "PARP9", "OAS2", "OAS1", "MX2", "MX1", "LY6E", "ISG15", "IFIT3", "IFI6", "IFI44L", "IFI35", "HERC5", "EPSTI1", "EIF2AK2", "CMPK2", "BST2"))
+dfs <- AddModuleScore(dfs,features = list(stimGenes),name = "IFN_Stimulation")
+
+myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+myBcrs$barcode <- paste0(myBcrs$X,"-1")
+dfs$bcr <- ifelse(colnames(dfs)%in%myBcrs$barcode,1,0)
+
+myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+myTcrs$barcode <- paste0(myTcrs$X,"-1")
+dfs$tcr <- ifelse(colnames(dfs)%in%myTcrs$barcode,1,0)
+
+dfs$doublet <- ifelse(dfs$souporcell_status=="doublet",1,0)
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_500hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_500hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "souporcell_status", label=T, reduction="umap_RNA_500hvgs",pt.size = .01,order = c("doublet","singlet","unassigned"),cols = c("green","grey","red"))
+DimPlot(dfs,group.by = "orig.ident", label=T, reduction="umap_RNA_500hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$orig.ident)))) + NoLegend()
+DimPlot(dfs,group.by = "patient_id", label=T, reduction="umap_RNA_500hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$patient_id))))
+FeaturePlot(dfs,features = c("nFeature_RNA","percentMito","IFN_Stimulation1","VIRAL-SARS-CoV2","nFeature_RNA"),reduction="umap_RNA_500hvgs",max.cutoff = "q90",combine = F)
+FeaturePlot(dfs,features = c("AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","tcr","bcr"),reduction="umap_RNA_500hvgs",max.cutoff = "q90",combine = F)
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "souporcell_status", label=T, reduction="umap_RNA_1000hvgs",pt.size = .01,order = c("doublet","singlet","unassigned"),cols = c("green","grey","red"))
+DimPlot(dfs,group.by = "orig.ident", label=T, reduction="umap_RNA_1000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$orig.ident)))) + NoLegend()
+DimPlot(dfs,group.by = "patient_id", label=T, reduction="umap_RNA_1000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$patient_id))))
+FeaturePlot(dfs,features = c("nFeature_RNA","percentMito","IFN_Stimulation1","VIRAL-SARS-CoV2","nFeature_RNA"),reduction="umap_RNA_1000hvgs",max.cutoff = "q90",combine = F)
+FeaturePlot(dfs,features = c("AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","tcr","bcr"),reduction="umap_RNA_1000hvgs",max.cutoff = "q90",combine = F)
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "souporcell_status", label=T, reduction="umap_RNA_2000hvgs",pt.size = .01,order = c("doublet","singlet","unassigned"),cols = c("green","grey","red"))
+DimPlot(dfs,group.by = "orig.ident", label=T, reduction="umap_RNA_2000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$orig.ident)))) + NoLegend()
+DimPlot(dfs,group.by = "patient_id", label=T, reduction="umap_RNA_2000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$patient_id))))
+FeaturePlot(dfs,features = c("nFeature_RNA","percentMito","IFN_Stimulation1","VIRAL-SARS-CoV2","nFeature_RNA"),reduction="umap_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+FeaturePlot(dfs,features = c("AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","tcr","bcr"),reduction="umap_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+
+DimPlot(dfs,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfs$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfs,group.by = "souporcell_status", label=T, reduction="umap_RNA_4000hvgs",pt.size = .01,order = c("doublet","singlet","unassigned"),cols = c("green","grey","red"))
+DimPlot(dfs,group.by = "orig.ident", label=T, reduction="umap_RNA_4000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$orig.ident)))) + NoLegend()
+DimPlot(dfs,group.by = "patient_id", label=T, reduction="umap_RNA_4000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$patient_id))))
+DimPlot(dfs,group.by = "annotation_1", label=T, reduction="umap_RNA_4000hvgs",pt.size = .01,cols = distinctColorPalette(length(unique(dfs$annotation_1))))
+FeaturePlot(dfs,features = c("nFeature_RNA","percentMito","IFN_Stimulation1","VIRAL-SARS-CoV2","nFeature_RNA"),reduction="umap_RNA_4000hvgs",max.cutoff = "q90",combine = F)
+FeaturePlot(dfs,features = c("AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr"),reduction="umap_RNA_4000hvgs",max.cutoff = "q90",combine = F)
+
+DimPlot(dfs,group.by = "rna_snn_4000hvgs_res.1", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfs$rna_snn_4000hvgs_res.1)))) + NoLegend()
+DimPlot(dfs,group.by = "rna_snn_4000hvgs_res.4", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfs$rna_snn_4000hvgs_res.4)))) + NoLegend()
+
+dfs$annotation_1 <- "T other"
+dfs$annotation_1[dfs$rna_snn_4000hvgs_res.4%in%c("2")] <- "T MAI"
+dfs$annotation_1[dfs$rna_snn_4000hvgs_res.4%in%c("52","7")] <- "T g/d"
+dfs$annotation_1[dfs$rna_snn_4000hvgs_res.4%in%c("36","38")] <- "T reg"
+dfs$annotation_1[dfs$rna_snn_4000hvgs_res.4%in%c("42","15","57","56","49","53","51")] <- "doublet"
+#write_rds(dfs$annotation_1,"/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.firstAnnot_unconventional_and_doublets.rds")
+#dfs$annotation_1 <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.firstAnnot_unconventional_and_doublets.rds")
+
+dfs_list <- list()
+for (cell_type in unique(dfs$annotation_1)) {
+  if (!(cell_type%in%names(dfs_list)) & !(cell_type%in%c("doublet","T other"))) {
+    dftemp <- subset(dfs,cells=colnames(dfs)[dfs$annotation_1==cell_type])
+    dftemp <- DietSeurat(dftemp)
+    for (nhvgs in c(500,1000,2000,4000)) {
+      dftemp <- FindVariableFeatures(dftemp,nfeatures=nhvgs) 
+      VariableFeatures(dftemp) <- VariableFeatures(dftemp)[!grepl('^TR[AB][VDJ]|^IG[HKL][VDJC]',VariableFeatures(dftemp))]
+      dftemp <- ScaleData(dftemp) %>% RunPCA(reduction.name = paste0("pca_RNA_",nhvgs,"hvgs"),npcs = 30) %>% RunUMAP(reduction = paste0("pca_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_RNA_",nhvgs,"hvgs"), reduction.key=paste0("umap_RNA_",nhvgs,"hvgs_"))
+      dftemp <- RunHarmony(dftemp, group.by.vars = "orig.ident",assay.use = "RNA",reduction = paste0("pca_RNA_",nhvgs,"hvgs"),reduction.save = paste0("harmony_RNA_",nhvgs,"hvgs"))
+      dftemp <- RunUMAP(dftemp,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_harmony_RNA_",nhvgs,"hvgs"),reduction.key=paste0("umap_harmony_RNA_",nhvgs,"hvgs_"))
+      dftemp <- FindNeighbors(dftemp, dims = 1:30,reduction = paste0("pca_RNA_",nhvgs,"hvgs"), graph.name=paste0("rna_snn_",nhvgs,"hvgs"))
+      dftemp <- FindClusters(dftemp, graph.name = paste0("rna_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+      dftemp <- FindNeighbors(dftemp, dims = 1:30,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), graph.name=paste0("harmony_snn_",nhvgs,"hvgs"))
+      dftemp <- FindClusters(dftemp, graph.name = paste0("harmony_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+    }
+    dfs_list[[cell_type]] <- dftemp
+    rm(dftemp)
+    gc()
+    print(paste(cell_type,"done"))
+  }
+}
+write_rds(dfs_list,"/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.dfs_list.rds")
+dfs_list <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.dfs_list.rds")
+
+
+
+# Second round of annotation of conventional T cells
+dfsub <- subset(dfs,cells=colnames(dfs)[dfs$annotation_1=="T other"])
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+dfsub <- DietSeurat(dfsub)
+
+DefaultAssay(dfsub) <- "RNA"
+dfsub <- NormalizeData(dfsub, assay = "RNA")
+for (nhvgs in c(1000,2000,4000)) {
+  dfsub <- FindVariableFeatures(dfsub,nfeatures=nhvgs) 
+  VariableFeatures(dfsub) <- VariableFeatures(dfsub)[!grepl('^TR[AB][VDJ]|^IG[HKL][VDJC]',VariableFeatures(dfsub))]
+  dfsub <- ScaleData(dfsub) %>% RunPCA(reduction.name = paste0("pca_RNA_",nhvgs,"hvgs"),npcs = 30) %>% RunUMAP(reduction = paste0("pca_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_RNA_",nhvgs,"hvgs"), reduction.key=paste0("umap_RNA_",nhvgs,"hvgs_"))
+}
+
+
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_RNA_1000hvgs",max.cutoff = "q99",combine = F)
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_RNA_2000hvgs",max.cutoff = "q99",combine = F)
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_RNA_4000hvgs",max.cutoff = "q99",combine = F)
+
+nhvgs <- 2000
+dfsub <- FindNeighbors(dfsub, dims = 1:30,reduction = paste0("pca_RNA_",nhvgs,"hvgs"), graph.name=paste0("rna_snn_",nhvgs,"hvgs"))
+dfsub <- FindClusters(dfsub, graph.name = paste0("rna_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet"),reduction="umap_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+
+dfsub <- RunHarmony(dfsub, group.by.vars = "orig.ident",assay.use = "RNA",reduction = paste0("pca_RNA_",nhvgs,"hvgs"),reduction.save = paste0("harmony_RNA_",nhvgs,"hvgs"))
+dfsub <- RunUMAP(dfsub,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_harmony_RNA_",nhvgs,"hvgs"),reduction.key=paste0("umap_harmony_RNA_",nhvgs,"hvgs_"))
+dfsub <- FindNeighbors(dfsub, dims = 1:30,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), graph.name=paste0("harmony_snn_",nhvgs,"hvgs"))
+dfsub <- FindClusters(dfsub, graph.name = paste0("harmony_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet"),reduction="umap_harmony_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+
+
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfsub,group.by = "rna_snn_2000hvgs_res.1", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.1)))) + NoLegend()
+DimPlot(dfsub,group.by = "rna_snn_2000hvgs_res.4", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.4)))) + NoLegend()
+DimPlot(dfsub,group.by = "orig.ident", label=F, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$orig.ident)))) + NoLegend()
+DimPlot(dfsub,group.by = "patient_id", label=F, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$patient_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "sample_id", label=F, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$sample_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "Phase", label=T, reduction="umap_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$Phase))))
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_RNA_2000hvgs",max.cutoff = "q99",combine = F)
+
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfsub,group.by = "harmony_snn_2000hvgs_res.1", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.1)))) + NoLegend()
+DimPlot(dfsub,group.by = "harmony_snn_2000hvgs_res.4", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.4)))) + NoLegend()
+DimPlot(dfsub,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$orig.ident)))) + NoLegend()
+DimPlot(dfsub,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$patient_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$sample_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "Phase", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$Phase))))
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_2000hvgs",max.cutoff = "q99",combine = F)
+
+myMarkers4 <- FindMarkers(dfsub,group.by = dfsub$harmony_snn_2000hvgs_res.4,ident.1 = "47", ident.2= "26",min.pct = .1,min.diff.pct = .1)
+myMarkers4 <- myMarkers4[order(myMarkers4$avg_log2FC),]
+myMarkers5 <- FindMarkers(dfsub,group.by = dfsub$harmony_snn_2000hvgs_res.1,ident.1 = "12", ident.2= "6",min.pct = .1,min.diff.pct = .1)
+myMarkers5 <- myMarkers5[order(myMarkers5$avg_log2FC),]
+
+
+myMarkers <- FindMarkers(dfsub,group.by = dfsub$rna_snn_2000hvgs_res.1,ident.1 = "11",min.pct = .5,min.diff.pct = .1,logfc.threshold = 1)
+myMarkers <- myMarkers[order(myMarkers$avg_log2FC),] # This is just low quality and stressed
+myMarkers2 <- FindMarkers(dfsub,group.by = dfsub$rna_snn_2000hvgs_res.1,ident.1 = "17", ident.2= "4",min.pct = .1,min.diff.pct = .1,logfc.threshold = 1)
+myMarkers2 <- myMarkers2[order(myMarkers2$avg_log2FC),] # same
+myMarkers3 <- FindMarkers(dfsub,group.by = dfsub$rna_snn_2000hvgs_res.1,ident.1 = "15", ident.2= "2",min.pct = .1,min.diff.pct = .1,logfc.threshold = 1)
+myMarkers3 <- myMarkers3[order(myMarkers3$avg_log2FC),] # same
+
+
+
+#Ok so this cluster at the bottom is just crap and doublets
+# Lets subset and recluster
+dfsub <- subset(dfsub,cells=colnames(dfsub)[dfsub$harmony_snn_2000hvgs_res.1!="9"])
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+dfsub <- DietSeurat(dfsub)
+
+DefaultAssay(dfsub) <- "RNA"
+dfsub <- NormalizeData(dfsub, assay = "RNA")
+
+nhvgs <- 2000
+dfsub <- FindVariableFeatures(dfsub,nfeatures=nhvgs) 
+VariableFeatures(dfsub) <- VariableFeatures(dfsub)[!grepl('^TR[AB][VDJ]|^IG[HKL][VDJC]',VariableFeatures(dfsub))]
+dfsub <- ScaleData(dfsub) %>% RunPCA(reduction.name = paste0("pca_RNA_",nhvgs,"hvgs"),npcs = 30) %>% RunUMAP(reduction = paste0("pca_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_RNA_",nhvgs,"hvgs"), reduction.key=paste0("umap_RNA_",nhvgs,"hvgs_"))
+dfsub <- RunHarmony(dfsub, group.by.vars = "orig.ident",assay.use = "RNA",reduction = paste0("pca_RNA_",nhvgs,"hvgs"),reduction.save = paste0("harmony_RNA_",nhvgs,"hvgs"))
+dfsub <- RunUMAP(dfsub,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_harmony_RNA_",nhvgs,"hvgs"),reduction.key=paste0("umap_harmony_RNA_",nhvgs,"hvgs_"))
+
+dfsub <- FindNeighbors(dfsub, dims = 1:30,reduction = paste0("pca_RNA_",nhvgs,"hvgs"), graph.name=paste0("rna_snn_",nhvgs,"hvgs"))
+dfsub <- FindClusters(dfsub, graph.name = paste0("rna_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet"),reduction="umap_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+
+dfsub <- FindNeighbors(dfsub, dims = 1:30,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), graph.name=paste0("harmony_snn_",nhvgs,"hvgs"))
+dfsub <- FindClusters(dfsub, graph.name = paste0("harmony_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet"),reduction="umap_harmony_RNA_2000hvgs",max.cutoff = "q90",combine = F)
+
+DimPlot(dfsub,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dfsub,group.by = "harmony_snn_2000hvgs_res.1", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.1)))) + NoLegend()
+DimPlot(dfsub,group.by = "harmony_snn_2000hvgs_res.4", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$rna_snn_2000hvgs_res.4)))) + NoLegend()
+DimPlot(dfsub,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$orig.ident)))) + NoLegend()
+DimPlot(dfsub,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$patient_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$sample_id)))) + NoLegend()
+DimPlot(dfsub,group.by = "Phase", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$Phase))))
+DimPlot(dfsub,group.by = "annotation_1", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dfsub$annotation_1))))
+FeaturePlot(dfsub,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_2000hvgs",max.cutoff = "q99",combine = F)
+
+dfsub$annotation_1 <- "T other"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(42,12,39,31,29,35,27,20,13,23,22,26,45,11,17,7,21,19,24,30)] <- "T CD4 Naive"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(36,16,9,14,25,10,4,44,47,43)] <- "T CD8 Naive"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(1,2,41,46)] <- "T CD8 CTL"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(18,5)] <- "T CD8 Memory"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(40)] <- "T mixed g/d"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(6,3,28,32,33,34,37,15,8)] <- "T CD4 Helper"
+dfsub$annotation_1[dfsub$harmony_snn_2000hvgs_res.4%in%c(37,43,30,38)] <- "IFN stim"
+
+write_rds(dfsub$annotation_1,"/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.firstAnnot_broadNaiveEffectors.rds")
+dfsub$annotation_1 <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.firstAnnot_broadNaiveEffectors.rds")
+df_list <- list()
+for (cell_type in unique(dfsub$annotation_1)) {
+  if (!(cell_type%in%names(df_list))) {
+    dftemp <- subset(dfsub,cells=colnames(dfsub)[dfsub$annotation_1==cell_type])
+    dftemp <- DietSeurat(dftemp)
+    for (nhvgs in c(500,1000,2000,4000)) {
+      dftemp <- FindVariableFeatures(dftemp,nfeatures=nhvgs) 
+      VariableFeatures(dftemp) <- VariableFeatures(dftemp)[!grepl('^TR[AB][VDJ]|^IG[HKL][VDJC]',VariableFeatures(dftemp))]
+      dftemp <- ScaleData(dftemp) %>% RunPCA(reduction.name = paste0("pca_RNA_",nhvgs,"hvgs"),npcs = 30) %>% RunUMAP(reduction = paste0("pca_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_RNA_",nhvgs,"hvgs"), reduction.key=paste0("umap_RNA_",nhvgs,"hvgs_"))
+      dftemp <- RunHarmony(dftemp, group.by.vars = "orig.ident",assay.use = "RNA",reduction = paste0("pca_RNA_",nhvgs,"hvgs"),reduction.save = paste0("harmony_RNA_",nhvgs,"hvgs"))
+      dftemp <- RunUMAP(dftemp,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), dims = 1:30,reduction.name = paste0("umap_harmony_RNA_",nhvgs,"hvgs"),reduction.key=paste0("umap_harmony_RNA_",nhvgs,"hvgs_"))
+      dftemp <- FindNeighbors(dftemp, dims = 1:30,reduction = paste0("pca_RNA_",nhvgs,"hvgs"), graph.name=paste0("rna_snn_",nhvgs,"hvgs"))
+      dftemp <- FindClusters(dftemp, graph.name = paste0("rna_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+      dftemp <- FindNeighbors(dftemp, dims = 1:30,reduction = paste0("harmony_RNA_",nhvgs,"hvgs"), graph.name=paste0("harmony_snn_",nhvgs,"hvgs"))
+      dftemp <- FindClusters(dftemp, graph.name = paste0("harmony_snn_",nhvgs,"hvgs"), resolution = c(1,4),algorithm = 4, method="igraph")
+    }
+    df_list[[cell_type]] <- dftemp
+    rm(dftemp)
+    gc()
+    print(paste(cell_type,"done"))
+  }
+}
+write_rds(df_list,"/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.df_list.rds")
+df_list <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcsAnnot.T.df_list.rds")
+
+names(df_list)
+dftemp <- df_list[["T CD4 Naive"]]
+# 2000 hvgs gives best isolation of doublets but 500 gives a clearer cut sox4+. SOX4+ is also ITM2A high, which is an activation marker
+# SOX4 is super high in the thymus, and they also express ITGAE (known recent thymic emmigrant marker!), so they're RTEs (recent thymic emmigrant)
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(10)] <- "T CD4 Naive RTE"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.1%in%c(9,10)] <- "doublet"
+annotCd4Naive <- dftemp$annotation_1
+df_list[["T CD4 Naive"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T CD8 Naive"]]
+# CD8 also has these SOX4+ naives, here they also express Helios (IKZF2)
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.1%in%c(4,10)] <- "doublet"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.1%in%c(9)] <- "T CD8 Naive RTE"
+annotCd8Naive <- dftemp$annotation_1
+df_list[["T CD8 Naive"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T CD8 CTL"]]
+#CD45RA/RO is much better at 4000hvgs
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.1%in%c(5,10,1,11,6,13,9)] <- "T CD8 EMRA"
+#But the rest at 1000hvgs
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.1%in%c(18,10,15)] <- "T g/d CTL" # g/d T
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.1%in%c(14)] <- "T CD4 CTL" # ctl
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.1%in%c(13,7)] <- "NKT" # nkt
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(19,53,11,42,16)] <- "doublet" # doublets
+annotCTL <- dftemp$annotation_1
+df_list[["T CD8 CTL"]]$annotation_1 <- dftemp$annotation_1
+#Lets split the g/d CTLs further
+dfsub <- subset(dftemp,cells=colnames(dftemp)[dftemp$annotation_1=="T g/d CTL"])
+# add to the df_list
+
+dftemp <- df_list[["T g/d CTL"]]
+dftemp$annotation_1 <- "T g/d CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(10,4,9)] <- "T CD8 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(1,2)] <- "T GammaV9 DeltaV1 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(3)] <- "T GammaV3 DeltaV2 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(6)] <- "T GammaV1/3 DeltaV2 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(7,8)] <- "T GammaV2-4 DeltaV1 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.1%in%c(5)] <- "T GammaV4 DeltaV3 CTL"
+df_list[["T g/d CTL"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T CD8 Memory"]]
+dftemp$annotation_1 <- "T CD8 CM"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.1%in%c(2,3,7,6,10)] <- "T CD8 EM"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.4%in%c(8,5,46)] <- "doublet"
+df_list[["T CD8 Memory"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T CD4 Helper"]]
+dftemp$annotation_1 <- "T CD4 Helper 0"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(19,23,8,18)] <- "T CD4 fh"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(15,33,38,9,7,10,37,14,32)] <- "T CD4 Helper 1"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(1,44,42,6)] <- "T CD4 Helper 2"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(35,2,17,20,27)] <- "T CD4 Helper 17"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(36,30,49,12,15,3,16,45)] <- "doublet"
+df_list[["T CD4 Helper"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T mixed g/d"]]
+#Ok so there's a bunch of gd clusters, one cd8 EM cluster, and mostly cd8 CM? One IFN
+# They all have this baseline g/d expression. Is this different from the regular CD8s or regular g/ds?
+dftemp$annotation_1 <- "T CD8 CM"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(16)] <- "T CD8 EM"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(19,1,9,8,10,3,7,13,17,20,15,28,4,6)] <- "T V-Delta-1 Naive"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(1,15,4,6)] <- "T V-Delta-1 Naive SOX4+"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(38)] <- "T CD8 CM IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(18,19,39,14,11)] <- "doublet"
+df_list[["T mixed g/d"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["IFN stim"]] # This is too complex, subset
+dftemp$annotation_1 <- "T naive IFN"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.1%in%c(8,3,5)] <- "T mature IFN"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.1%in%c(10)] <- "doublet"
+dfsub <- dftemp
+# add to the df_list
+
+dftemp <- df_list[["T naive IFN"]]
+dftemp$annotation_1 <- "T CD4 Naive IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(28,13,3,32,8,17)] <- "T CD8 Naive IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(36,2,26,18,7)] <- "T CD4 Helper 0 IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(10)] <- "T CD4 Helper 1 IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(1)] <- "doublet"
+dfsub <- subset(dftemp,cells=colnames(dftemp)[dftemp$annotation_1=="T CD4 Helper 1 IFN stim"])
+df_list[["T naive IFN"]]$annotation_1 <- dftemp$annotation_1
+# add helpers1 to the df_list to separate CD8 and CD4
+
+dftemp <- df_list[["T CD4 Helper 1 IFN stim"]]
+dftemp$annotation_1 <- "T CD4 Helper 1 IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.1%in%c(5,6)] <- "T CD8 CM IFN stim"
+df_list[["T CD4 Helper 1 IFN stim"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- df_list[["T mature IFN"]] # My goodness this is a hard one.. CTL + naive markers == activation of a naive -> cytotoxic?
+dftemp$annotation_1 <- as.character(dftemp$harmony_snn_500hvgs_res.4)
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(19,2)] <- "T reg CM"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(22,8,13,9,38)] <- "T CD4 Helper 17"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(29,7,35)] <- "T CD4 Helper 0"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(18)] <- "T CD8 CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(40,25,17,14,16,36,34)] <- "T CD4 Activated CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(21,1)] <- "T CD4 Helper 2"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(24)] <- "T CD4 Helper 1"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(16)] <- "T CD4 Activated CTL cycling"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(10,37)] <- "T CD8 Activated CTL cycling"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(15,3,5,10,4)] <- "T CD8 Activated CTL"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(31,20,27,26,32)] <- "T CD8 EM"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(12,11,6,30)] <- "T Double Negative"
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(1,18,41,23)] <- paste(dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(1,18,41,23)],"IFN stim")
+dftemp$annotation_1[dftemp$harmony_snn_500hvgs_res.4%in%c(33,23,39,28,41)] <- "doublet"
+df_list[["T mature IFN"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- dfs_list[["T reg"]]
+dftemp <- annotateDftemp(dftemp)
+dftemp$annotation_1 <- "T reg EM"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.1%in%c(1,3,14,5,9)] <- "T reg CM"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.4%in%c(36,37)] <- "T reg CM GZMK+ IFNG+"
+dftemp$annotation_1[dftemp$harmony_snn_1000hvgs_res.4%in%c(49)] <- "T reg EM cycling"
+dftemp$annotation_1[dftemp$harmony_snn_4000hvgs_res.4%in%c(41,43,38,48,50,5)] <- "doublet"
+dfs_list[["T reg"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- dfs_list[["T MAI"]]
+dftemp <- annotateDftemp(dftemp)
+dftemp$annotation_1 <- "T MAI"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(56,21,15,2,57,54,47,30,12,41,32,6,52,1,27,28,20,14,17,10,43)] <- "T MAI activated"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(26,38,16,8)] <- "T MAI IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(3)] <- "T CM g/d"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(26,38,16,8)] <- "doublet"
+dfs_list[["T MAI"]]$annotation_1 <- dftemp$annotation_1
+
+dftemp <- dfs_list[["T g/d"]]
+dftemp <- annotateDftemp(dftemp)
+dftemp$annotation_1 <- "T g/d EM"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(20,17,9,5,51,49,43,22,11,34,46,10,8,16,48,47,24,36,26,18,1,7)] <- "T g/d CM"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(7)] <- "T g/d CM IFN stim"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(4,51,21,28,14,50,44,6)] <- "doublet"
+dfs_list[["T g/d"]]$annotation_1 <- dftemp$annotation_1
+
+#Include cycling cells as well
+dftemp <- read_rds("/mnt/projects/RL007_challengeStudy/data/df_pbmcs.Cycling.rds")
+dftemp$annotation_1 <- "Cycling"
+dftemp <- annotateDftemp(dftemp)
+# add to df_list
+dftemp <- df_list[["Cycling"]]
+dftemp$annotation_1 <- "NA"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(22,37,26,40,3)] <- "T reg EM Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(26)] <- "T reg CM Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(17,11,27,14)] <- "T CD4 Helper 1 Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(36,20,31,24,16,18,1,34,21,10,7)] <- "T CD8 Activated CTL Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(30)] <- "T Double Negative Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(8)] <- "T CD8 CTL Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(33,29,19,4,12,35,9,5,6)] <- "NK CD56+ Cycling"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(28)] <- "Plasmablast"
+dftemp$annotation_1[dftemp$harmony_snn_2000hvgs_res.4%in%c(41,38,39,15,25,13,2,32,23,34)] <- "doublet"
+df_list[["Cycling"]]$annotation_1 <- dftemp$annotation_1
+
+annotateDftemp <- function(dftemp=dftemp) {
+  dftemp$time_point_factor <- factor(dftemp$time_point,levels=c("D-1","D3","D7","D10","D14","D28"))
+  stimGenes <- rev(c("IRF7", "XAF1", "UBE2L6", "TRIM22", "STAT1", "SP110", "SAMD9L", "SAMD9", "PLSCR1", "PARP9", "OAS2", "OAS1", "MX2", "MX1", "LY6E", "ISG15", "IFIT3", "IFI6", "IFI44L", "IFI35", "HERC5", "EPSTI1", "EIF2AK2", "CMPK2", "BST2"))
+  dftemp <- AddModuleScore(dftemp,features = list(stimGenes),name = "IFN_Stimulation")
+  
+  myBcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/bcr/bcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+  myBcrs$barcode <- paste0(myBcrs$X,"-1")
+  dftemp$bcr <- ifelse(colnames(dftemp)%in%myBcrs$barcode,1,0)
+  
+  myTcrs <- read.csv("/mnt/projects/RL007_challengeStudy/data/tcr/tcr_220303_fromScirpy.csv",header = T,stringsAsFactors = F)
+  myTcrs$barcode <- paste0(myTcrs$X,"-1")
+  dftemp$tcr <- ifelse(colnames(dftemp)%in%myTcrs$barcode,1,0)
+  
+  dftemp$doublet <- ifelse(dftemp$souporcell_status=="doublet",1,0)
+  return(dftemp)
+}
+
+DimPlot(dftemp,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_500hvgs_res.1", label=T, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_500hvgs_res.1)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_500hvgs_res.4", label=T, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_500hvgs_res.4)))) + NoLegend()
+DimPlot(dftemp,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$orig.ident)))) + NoLegend()
+DimPlot(dftemp,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$patient_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$sample_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "Phase", label=T, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$Phase))))
+DimPlot(dftemp,group.by = "annotation_1", label=T, reduction="umap_harmony_RNA_500hvgs",cols = distinctColorPalette(length(unique(dftemp$annotation_1))))
+FeaturePlot(dftemp,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_500hvgs",max.cutoff = "q99",combine = F)
+
+DimPlot(dftemp,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_1000hvgs_res.1", label=T, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_1000hvgs_res.1)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_1000hvgs_res.4", label=T, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_1000hvgs_res.4)))) + NoLegend()
+DimPlot(dftemp,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$orig.ident)))) + NoLegend()
+DimPlot(dftemp,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$patient_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$sample_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "Phase", label=T, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$Phase))))
+DimPlot(dftemp,group.by = "annotation_1", label=T, reduction="umap_harmony_RNA_1000hvgs",cols = distinctColorPalette(length(unique(dftemp$annotation_1))))
+FeaturePlot(dftemp,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","CD27","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_1000hvgs",max.cutoff = "q99",combine = F)
+
+DimPlot(dftemp,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_2000hvgs_res.1", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_2000hvgs_res.1)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_2000hvgs_res.4", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_2000hvgs_res.4)))) + NoLegend()
+DimPlot(dftemp,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$orig.ident)))) + NoLegend()
+DimPlot(dftemp,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$patient_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$sample_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "Phase", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$Phase))))
+DimPlot(dftemp,group.by = "annotation_1", label=T, reduction="umap_harmony_RNA_2000hvgs",cols = distinctColorPalette(length(unique(dftemp$annotation_1))))
+FeaturePlot(dftemp,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_2000hvgs",max.cutoff = "q99",combine = F)
+
+DimPlot(dftemp,group.by = "yoshida_detailed_predLabel", label=T, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$yoshida_detailed_predLabel)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_4000hvgs_res.1", label=T, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_4000hvgs_res.1)))) + NoLegend()
+DimPlot(dftemp,group.by = "harmony_snn_4000hvgs_res.4", label=T, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$harmony_snn_4000hvgs_res.4)))) + NoLegend()
+DimPlot(dftemp,group.by = "orig.ident", label=F, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$orig.ident)))) + NoLegend()
+DimPlot(dftemp,group.by = "patient_id", label=F, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$patient_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "sample_id", label=F, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$sample_id)))) + NoLegend()
+DimPlot(dftemp,group.by = "Phase", label=T, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$Phase))))
+DimPlot(dftemp,group.by = "annotation_1", label=T, reduction="umap_harmony_RNA_4000hvgs",cols = distinctColorPalette(length(unique(dftemp$annotation_1))))
+FeaturePlot(dftemp,features = c("nCount_RNA","AB-CD45RA","AB-CD45RO","AB-CD8A","AB-CD4","CD4","tcr","bcr","doublet","IFN_Stimulation1"),reduction="umap_harmony_RNA_4000hvgs",max.cutoff = "q99",combine = F)
+
+
+Idents(dftemp) <- dftemp$annotation_1
+myMarkersHelpers <- FindAllMarkers(dftemp)
+myMarkersHelpersAdt <- FindAllMarkers(dftemp,assay = "ADT")
+myMarkersHelpers <- myMarkersHelpers[order(-myMarkersHelpers$avg_log2FC),]
+head(myMarkersHelpers[myMarkersHelpers$cluster=="T CD4 Helper 2",],20)
+Idents(dftemp) <- dftemp$harmony_snn_1000hvgs_res.4
+myMarkersCTL <- FindAllMarkers(dftemp)
+myMarkersCTL <- myMarkersCTL[order(-myMarkersCTL$avg_log2FC),]
+Idents(dftemp) <- dftemp$harmony_snn_2000hvgs_res.4
+myMarkersGd <- FindMarkers(dftemp,ident.1 = "1",ident.2 = "6")
+myMarkersGd <- myMarkersGd[order(-myMarkersGd$avg_log2FC),]
+head(myMarkersCTL[myMarkersCTL$cluster==18,],20) # g/d T
+head(myMarkersCTL[myMarkersCTL$cluster==10,],20) # g/d T
+head(myMarkersCTL[myMarkersCTL$cluster==15,],20) # g/d T
+head(myMarkersCTL[myMarkersCTL$cluster==8,],20) # ribosomal stuff
+head(myMarkersCTL[myMarkersCTL$cluster==14,],20) # CD4 CTLs
+Idents(dftemp) <- dftemp$harmony_snn_2000hvgs_res.4
+myMarkersGd1 <- FindMarkers(dftemp,ident.1 = "1")
+myMarkersGd4 <- FindMarkers(dftemp,ident.1 = "4")
+head(myMarkersGd1[order(-myMarkersGd1$avg_log2FC),],50)
+head(myMarkersGd4[order(-myMarkersGd4$avg_log2FC),],50)
+myMarkersGd15 <- FindMarkers(dftemp,ident.1 = "1",ident.2 = "5")
+Idents(dftemp) <- dftemp$harmony_snn_2000hvgs_res.4
+myMarkersGd2 <- FindMarkers(dftemp,ident.1 = "2")
+head(myMarkersGd2[order(myMarkersGd2$avg_log2FC),],50)
+Idents(dftemp) <- dftemp$harmony_snn_2000hvgs_res.1
+myMarkersMait13 <- FindMarkers(dftemp,ident.1 = "1",ident.2 = "3")
+head(myMarkersMait13[order(myMarkersMait13$avg_log2FC),],50)
+Idents(dftemp) <- dftemp$harmony_snn_4000hvgs_res.4
+myMarkersInf10 <- FindMarkers(dftemp,ident.1 = "10",ident.2 = "6")
+myMarkersInf2832 <- FindMarkers(dftemp,ident.1 = "28",ident.2 = "32")
+head(myMarkersInf2832[order(myMarkersInf2832$avg_log2FC),],50)
+10
+Idents(dftemp) <- dftemp$harmony_snn_500hvgs_res.1
+myMarkersInfMatIfn <- FindMarkers(dftemp,ident.1 = "3")
+head(myMarkersInfMatIfn[order(-myMarkersInfMatIfn$avg_log2FC),],50)
+Idents(dftemp) <- dftemp$harmony_snn_1000hvgs_res.4
+myMarkersInfNaiveIfn <- FindMarkers(dftemp,ident.1 = "1",ident.2 = "2")
+Idents(dftemp) <- dftemp$annotation_1
+myMarkersInfNaiveGd <- FindMarkers(dftemp,ident.1 = "T g/d",ident.2 = "T CD8 CM")
+
+```
+
+
+```{r label="plot marker gene expression",fig.width=20,fig.height=10,eval=FALSE}
+
+Idents(dftemp) <- dftemp$harmony_snn_500hvgs_res.1
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_500hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(immuneMarkers),group.by = "harmony_snn_500hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_500hvgs_res.1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+plot(1)
+Idents(dftemp) <- dftemp$harmony_snn_1000hvgs_res.1
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_1000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_1000hvgs_res.1",cluster.idents = T,scale.max = 50) + RotatedAxis()
+DotPlot(dftemp,features = c(immuneMarkers),group.by = "harmony_snn_1000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_1000hvgs_res.1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+plot(1)
+Idents(dftemp) <- dftemp$harmony_snn_2000hvgs_res.1
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_2000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_2000hvgs_res.1",cluster.idents = T,scale.max = 50) + RotatedAxis()
+DotPlot(dftemp,features = c(immuneMarkers),group.by = "harmony_snn_2000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_2000hvgs_res.1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+plot(1)
+# Idents(dftemp) <- dftemp$harmony_snn_4000hvgs_res.1
+# DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_4000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+Idents(dftemp) <- dftemp$harmony_snn_4000hvgs_res.1
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_4000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_4000hvgs_res.1",cluster.idents = T,scale.max = 50) + RotatedAxis()
+DotPlot(dftemp,features = c(immuneMarkers),group.by = "harmony_snn_4000hvgs_res.1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_4000hvgs_res.1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+
+
+DotPlot(dftemp,features = c(immuneMarkers),group.by = "annotation_1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "annotation_1",cluster.idents = T) + RotatedAxis()
+DotPlot(dftemp,features = c("AB-CD45RA","AB-CD45RO"), assay="ADT",group.by = "annotation_1",cluster.idents = T) + RotatedAxis()
+
+Idents(dftemp) <- dftemp$harmony_snn_500hvgs_res.4
+DotPlot(dftemp,features = c(myImmuneMarkers),group.by = "harmony_snn_500hvgs_res.4",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_500hvgs_res.4",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dftemp,features = c("AB-CD45RA","AB-CD45RO"),group.by = "harmony_snn_500hvgs_res.4",cluster.idents = T,scale.max = 100,assay = "ADT") + RotatedAxis()
+DotPlot(df_list[["T CD4 Naive"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T CD4 Helper"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T CD8 Naive"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T CD8 Memory"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T CD8 CTL"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T mixed g/d"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T mature IFN"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T g/d"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T MAI"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T reg"]],features = myImmuneMarkers, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+
+Idents(dftemp) <- dftemp$harmony_snn_4000hvgs_res.4
+DotPlot(dftemp,features = c(stimGenes),group.by = "harmony_snn_4000hvgs_res.4",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(df_list[["T mixed g/d"]],features = stimGenes, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T g/d"]],features = stimGenes, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T MAI"]],features = stimGenes, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+DotPlot(dfs_list[["T reg"]],features = stimGenes, assay="RNA",group.by = "annotation_1",cluster.idents = T,scale.max = 100) + RotatedAxis()
+
+myImmuneMarkers <- unique(c(
+  "TNFRSF18", "TNFRSF4",
+ "GNLY",
+ "NCR1",
+ "NCAM1",
+ "CD3D",
+"CD4",
+"CD8A",
+"SELL",
+"CCR7",
+"CD27",
+"LEF1",
+ "IL7R",
+"CXCR5",
+"SOX4",
+ "GZMH",
+ "GZMK",
+ "GZMA",
+ "GZMB",
+ "PRF1",
+"CCL5", "GATA3", "CCR4", "RORC", "IL17A", "CCR6","CTSH",
+ "TRGV9",
+ "TRDV2",
+ "TRDV1",
+ "TRDV3",
+ "TRAV1-2",
+ "SLC4A10",
+ "FOXP3",
+ "IL2RA",
+ "CD38",
+'ITGAE',
+ "MKI67",'CDK1',
+'IFI44L','MX2',"VIRAL-SARS-CoV2",
+"PPBP",
+"HBB"
+))
+
+immuneMarkers <- unique(c('CD3D', "SELL", 'CCR7', 'LEF1', 'CD4', 'FOXP3', 'CTLA4', 'CCR4', 'FRMD4B', 'CD40LG', 'CD8A', 'DBN1', 'HELB', 'GZMK', 'GZMH', 'PRF1', 'EOMES', 'TRGV2', 'TRGV9', 'TRDV2', 'TRAV1-2', 'SLC4A10', 'GNLY', 'NCAM1', 'TBX21', 'KLRF1', 'KRT81', 'PCDH9', 'MS4A1', 'FCER2', 'COL19A1','CD27', 'FCRL5', 'FCRL4', 'FCRL3', 'CAMK1', 'MKI67', 'MCM2', 'CHPF', 'IGHG1', 'IGKC', 'IGLC2', 'C1QA', 'MARCO', 'SDS', 'RNASE1', 'MT1G', 'CD207', 'CD1C', 'CD14', 'VCAN', 'GPBAR1', 'IL6', 'FCGR3B', 'PROK2', 'LAMP3', 'NR4A3', 'CLEC4C', 'LILRA4', 'FDCSP', 'CR2', 'TPSB2', 'MS4A2', 'CXCL10', "VIRAL-SARS-CoV2", 'IFI27', "IFIT1", "MX2", "NFKBIA", "NFKB1", "HLA-DRB5", "HLA-DRB1", "HLA-DRA", "HLA-DQA2", 'HLA-DPA1', 'HLA-DQB1', 'PMEL', 'MLANA','MUC5AC','PIFO','PIGR',"tcr","bcr","doublet"))
+myImmuneMarkers <- unique(c("CD3D","CD4","CD8A","CCR7","LEF1","CD27","SELL", "EOMES", "PRDM1", "IL7R", "GZMH", "GZMK", "GZMA", "GZMB", "PRF1", "TRGV9", "TRDV2", "FOXP3", "IL2RA", "TRAV7", "TRAV1-2", "SLC4A10", "NCR1", "NCAM1", "GNLY", "TNFRSF18", "TNFRSF4", "KLRB1", "CD44", "FCER1G", "CD14", "FCGR3A", "IL6", "C1QA", "CLEC4C", "IL3RA", "AXL", "SIGLEC6", "CLEC9A", "FCER1A", "FCER2", "IGHD", "CD19", "CD24", "TCL1A", "IGHM", "CD79A", "MS4A1", "TNFRSF13B", "CR2", "BANK1", "JCHAIN", "CHPF", "IGHG1", "TNFRSF13B", "TBX21", "FCRL5", "FCRL3", "ENTPD1", "MKI67", "CXCR5", "VIRAL-SARS-CoV2", 'IFI27', "IFIT1", "MX2", "NFKB1", "HLA-DRB5", "TCR", "BCR","ITGAE","CD69","tcr","bcr","doublet","TRAV10","TRAJ18"))
+myImmuneMarkers <- unique(c("CD3D","CD4","CD8A","CCR7","LEF1","CD27","SELL", "EOMES", "PRDM1", "IL7R", "GZMH", "GZMK", "GZMA", "GZMB", "PRF1", "TRGV9", "TRDV1", "TRDV2", "TRDV3",rownames(df)[grep("^TRGV[0-9]*$",rownames(df))], "FOXP3", "IL2RA", "TRAV7", "TRAV1-2", "SLC4A10", "NCR1", "NCAM1", "GNLY", "TNFRSF18", "TNFRSF4", "KLRB1", "CD44", "FCER1G", "CD14", "FCGR3A", "HLA-DRA","S100A9", "ITM2A", "IL6", "IFNG", "TBX21", "TNF", "CCL5", "GATA3", "IL4", "IL5","CCL4","CCR4", "RORC", "IL17A", "IL17F", "IL21", "CCR6","CTSH","RORA","S100A4", "TNFRSF13B", "TBX21", "FCRL5", "FCRL3", "ENTPD1", "MKI67","LTB","IL32", "VIRAL-SARS-CoV2", 'IFI27', "IFIT1", "MX2", "NFKB1", "HLA-DRB5", "ITGAE","CD69","SOX4","ITM2A","IKZF2","CLEC11A", "CXCR5","BCL6","CD70","tcr","bcr","doublet","TRAV10","TRAJ18","TRBV25-1","TRGC2","TRGC1","TRDC","adt_AB-CD45RA"))
+stimGenes <- c("IRF7", "XAF1", "UBE2L6", "TRIM22", "STAT1", "SP110", "SAMD9L", "SAMD9", "PLSCR1", "PARP9", "OAS2", "OAS1", "MX2", "MX1", "LY6E", "ISG15", "IFIT3", "IFI6", "IFI44L", "IFI35", "HERC5", "EPSTI1", "EIF2AK2", "CMPK2", "BST2", "IFI27")
+
+```

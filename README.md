@@ -5,7 +5,7 @@ Repository with Rmarkdown files and Python notebooks and code to reproduce the f
 - RL007_challengeStudy_analysesAndVisualisations.Rmd contains analyses and visualisations of the figures in the manuscript that were generated in R
 - challenge_figures_LMD.ipynb contains Python code for several analyses, including most of the TCR analyses
 - GPR_predict_time_since_exposure is a directory that contains code, a model, and its output, to predict time since viral exposure based on predicted cell type abundances
-- A separate GitHub repo (Cell2TCR) contains the code and a tutorial to use our Cell2TCR workflow to identify activated TCR clonotype groups
+- A separate GitHub repo ([Cell2TCR](https://github.com/Teichlab/cell2tcr)) contains the code and a tutorial to use our Cell2TCR workflow to identify activated TCR clonotype groups
 
 ## Installation - Python environment
 
